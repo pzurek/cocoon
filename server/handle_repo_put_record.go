@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -10,13 +11,13 @@ import (
 )
 
 type ComAtprotoRepoPutRecordInput struct {
-	Repo       string         `json:"repo" validate:"required,atproto-did"`
-	Collection string         `json:"collection" validate:"required,atproto-nsid"`
-	Rkey       string         `json:"rkey" validate:"required,atproto-rkey"`
-	Validate   *bool          `json:"bool,omitempty"`
-	Record     MarshalableMap `json:"record" validate:"required"`
-	SwapRecord *string        `json:"swapRecord"`
-	SwapCommit *string        `json:"swapCommit"`
+	Repo       string          `json:"repo" validate:"required,atproto-did"`
+	Collection string          `json:"collection" validate:"required,atproto-nsid"`
+	Rkey       string          `json:"rkey" validate:"required,atproto-rkey"`
+	Validate   *bool           `json:"bool,omitempty"`
+	Record     MarshalableMap  `json:"record" validate:"required"`
+	SwapRecord json.RawMessage `json:"swapRecord,omitempty"`
+	SwapCommit json.RawMessage `json:"swapCommit,omitempty"`
 }
 
 func (s *Server) handlePutRecord(e echo.Context) error {
@@ -41,8 +42,17 @@ func (s *Server) handlePutRecord(e echo.Context) error {
 		return helpers.InputError(e, nil)
 	}
 
+	swapCommit, err := parseRepoSwap(req.SwapCommit, false)
+	if err != nil {
+		return helpers.InputError(e, nil)
+	}
+	swapRecord, err := parseRepoSwap(req.SwapRecord, true)
+	if err != nil {
+		return helpers.InputError(e, nil)
+	}
+
 	optype := OpTypeCreate
-	if req.SwapRecord != nil {
+	if swapRecord != nil && swapRecord.Defined() {
 		optype = OpTypeUpdate
 	}
 
@@ -58,13 +68,16 @@ func (s *Server) handlePutRecord(e echo.Context) error {
 			Rkey:       &req.Rkey,
 			Validate:   req.Validate,
 			Record:     &req.Record,
-			SwapRecord: req.SwapRecord,
+			SwapRecord: swapRecord,
 		},
-	}, req.SwapCommit, s.repoWriteAuthorization(e))
+	}, swapCommit, s.repoWriteAuthorization(e))
 	if err != nil {
 		var scopeErr repoScopeError
 		if errors.As(err, &scopeErr) {
 			return helpers.InsufficientScopeError(e, scopeErr.Error())
+		}
+		if errors.Is(err, errInvalidSwap) {
+			return e.JSON(400, map[string]string{"error": "InvalidSwap"})
 		}
 		logger.Error("error applying writes", "error", err)
 		return helpers.ServerError(e, nil)
