@@ -391,6 +391,14 @@ Just because something is implemented doesn't mean it is finished. Tons of these
 - [x] `com.atproto.sync.requestCrawl`
 - [x] `com.atproto.sync.subscribeRepos`
 
+`listBlobs?since=<revision>` lists current public-record blob references whose
+record was last written after that commit revision, including references whose
+payload has not arrived yet. Updating a record counts even if its blob is unchanged;
+deleted references are not listed. Imports assign all imported records the new
+destination commit revision. Legacy records without tracked revision history are
+included conservatively until rewritten or deleted, so incremental callers may
+receive older CIDs again. CID ordering, deduplication, and cursors still apply.
+
 ### Spaces (permissioned data, alpha)
 
 Cocoon implements the ATProto Spaces alpha. See [docs/spaces.md](docs/spaces.md).

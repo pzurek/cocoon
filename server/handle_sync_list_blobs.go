@@ -22,7 +22,7 @@ func (s *Server) handleSyncListBlobs(e echo.Context) error {
 		return helpers.InputError(e, nil)
 	}
 
-	// TODO: add tid param
+	since := e.QueryParam("since")
 	cursor := e.QueryParam("cursor")
 	limit, err := getLimitFromContext(e, 500)
 	if err != nil || limit < 1 || limit > 1000 {
@@ -63,10 +63,16 @@ func (s *Server) handleSyncListBlobs(e echo.Context) error {
 		e.Response().Header().Set("Retry-After", "1")
 		return e.JSON(http.StatusServiceUnavailable, map[string]string{"error": "BlobIndexNotReady", "message": "legacy blob references are being indexed; retry this request"})
 	}
-	// The DID/CID covering index seeks past even an exhausted cursor; no
-	// records, payloads, or earlier pages are read or decoded.
+	// Seek by DID/CID; incremental reads also consult last-write revisions,
+	// never record payloads. Unknown legacy history is included conservatively.
 	cstrs := make([]string, 0, limit)
-	if err := s.db.Raw(ctx, "SELECT DISTINCT blob_cid FROM public_blob_refs WHERE did = ? AND blob_cid > ? ORDER BY blob_cid LIMIT ?", nil, did, cursor, limit).Scan(&cstrs).Error; err != nil {
+	query := s.db.Client().WithContext(ctx).Table("public_blob_refs AS b").
+		Select("DISTINCT b.blob_cid").Where("b.did = ? AND b.blob_cid > ?", did, cursor)
+	if since != "" {
+		query = query.Joins("JOIN records AS r ON r.did = b.did AND r.nsid = b.nsid AND r.rkey = b.rkey").
+			Where("r.repo_rev = '' OR r.repo_rev > ?", since)
+	}
+	if err := query.Order("b.blob_cid").Limit(limit).Scan(&cstrs).Error; err != nil {
 		logger.Error("error getting blob references", "error", err)
 		return helpers.ServerError(e, nil)
 	}

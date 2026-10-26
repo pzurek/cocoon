@@ -110,6 +110,11 @@ func (s *Server) handleRepoImportRepo(e echo.Context) error {
 		if err != nil {
 			return err
 		}
+		// Imported records become current at this destination commit. The CAR
+		// does not carry each record's historical last-write revision.
+		if err := tx.Exec(ctx, "UPDATE records SET repo_rev = ? WHERE did = ?", nil, rev, urepo.Repo.Did).Error; err != nil {
+			return err
+		}
 		result := tx.Exec(ctx, "UPDATE repos SET root = ?, rev = ? WHERE did = ? AND rev = ?", nil, root.Bytes(), rev, urepo.Repo.Did, urepo.Rev)
 		if result.Error != nil {
 			return result.Error

@@ -689,6 +689,9 @@ func (rm *RepoMan) applyWrites(ctx context.Context, urepo models.Repo, writes []
 				return err
 			}
 		}
+		for i := range entries {
+			entries[i].RepoRev = rev
+		}
 		blobs, err := indexRecords(ctx, tx, urepo.Did, entries)
 		if err != nil {
 			return err

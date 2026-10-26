@@ -174,6 +174,8 @@ type Record struct {
 	Rkey      string `gorm:"primaryKey"`
 	Cid       string
 	Value     []byte
+	// RepoRev is the last committed write revision; empty is unknown legacy history.
+	RepoRev string `gorm:"not null;default:''"`
 }
 
 // PublicBlobRef is one public record's reference, independent of whether the
