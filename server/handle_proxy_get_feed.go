@@ -34,7 +34,7 @@ func (s *Server) handleProxyBskyFeedGetFeed(e echo.Context) error {
 
 	appViewClient := xrpc.Client{
 		Host:   appViewEndpoint,
-		Client: s.proxyHTTPClient,
+		Client: s.proxyClient(),
 	}
 	feedRecord, err := atproto.RepoGetRecord(e.Request().Context(), &appViewClient, "", feedUri.Collection().String(), feedUri.Authority().String(), feedUri.RecordKey().String())
 	if err != nil {

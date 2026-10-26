@@ -11,12 +11,47 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/gttp"
 	"github.com/google/uuid"
 	"github.com/haileyok/cocoon/internal/helpers"
 	"github.com/haileyok/cocoon/models"
 	"github.com/labstack/echo/v4"
 	secp256k1secec "gitlab.com/yawning/secp256k1-voi/secec"
 )
+
+func newProxyHTTPClient(opts ...gttp.Option) *http.Client {
+	client := gttp.New(append(opts,
+		gttp.WithStrictSSRFProtection(),
+		gttp.WithNoProxy(),
+		gttp.WithTimeout(30*time.Second),
+		gttp.WithNoRetries(),
+		gttp.WithDisableCompression(),
+	)...)
+	checkRedirect := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if err := checkRedirect(req, via); err != nil {
+			return err
+		}
+		// Go rebuilds headers from the original request on every redirect.
+		for _, previous := range via {
+			if !strings.EqualFold(previous.URL.Scheme, req.URL.Scheme) || !strings.EqualFold(previous.URL.Host, req.URL.Host) {
+				req.Header.Del("Authorization")
+				break
+			}
+		}
+		return nil
+	}
+	return client
+}
+
+func (s *Server) proxyClient() *http.Client {
+	s.proxyHTTPClientOnce.Do(func() {
+		if s.proxyHTTPClient == nil {
+			s.proxyHTTPClient = newProxyHTTPClient()
+		}
+	})
+	return s.proxyHTTPClient
+}
 
 func (s *Server) getAtprotoProxyEndpointFromRequest(e echo.Context) (string, string, string, error) {
 	svc := e.Request().Header.Get("atproto-proxy")
@@ -77,7 +112,7 @@ func (s *Server) handleProxy(e echo.Context) error {
 		body = nil
 	}
 
-	req, err := http.NewRequest(e.Request().Method, requrl.String(), body)
+	req, err := http.NewRequestWithContext(e.Request().Context(), e.Request().Method, requrl.String(), body)
 	if err != nil {
 		return err
 	}
@@ -167,11 +202,7 @@ func (s *Server) handleProxy(e echo.Context) error {
 		req.Header.Del("authorization")
 	}
 
-	client := s.proxyHTTPClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
+	resp, err := s.proxyClient().Do(req)
 	if err != nil {
 		return err
 	}

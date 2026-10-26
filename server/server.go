@@ -111,9 +111,9 @@ type Server struct {
 	spaceHTTP     *http.Client
 	spaceHTTPOnce sync.Once
 
-	// Optional client override for proxy and feed-record requests. Nil keeps
-	// each path's existing default client.
-	proxyHTTPClient *http.Client
+	// Proxy and feed-record requests share an SSRF-guarded client unless overridden.
+	proxyHTTPClient     *http.Client
+	proxyHTTPClientOnce sync.Once
 
 	lastRequestCrawl time.Time
 	requestCrawlMu   sync.Mutex

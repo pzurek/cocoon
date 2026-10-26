@@ -5,10 +5,14 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/gttp"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/haileyok/cocoon/identity"
 	"github.com/haileyok/cocoon/oauth/provider"
@@ -79,13 +84,13 @@ func TestProxyRPCPermissions(t *testing.T) {
 			}))
 			t.Cleanup(upstream.Close)
 			s := newTestServer(t)
-			s.proxyHTTPClient = upstream.Client()
+			s.proxyHTTPClient = proxyTestHTTPClient(t, upstream)
 			attachOauthProvider(t, s)
 			account := s.createTestAccount(t, "proxy.pds.test")
 			cache := identity.NewMemCache(10)
 			if err := cache.PutDoc("did:web:appview.test", &identity.DidDoc{
 				Id: "did:web:appview.test", Service: []identity.DidDocService{
-					{Id: "#view", ServiceEndpoint: upstream.URL}, {Id: "#other", ServiceEndpoint: upstream.URL},
+					{Id: "#view", ServiceEndpoint: "https://203.0.113.10"}, {Id: "#other", ServiceEndpoint: "https://203.0.113.10"},
 				},
 			}); err != nil {
 				t.Fatal(err)
@@ -241,8 +246,11 @@ func TestProxyTransport(t *testing.T) {
 		t.Run(method, func(t *testing.T) {
 			const payload = `{"text":"streamed request"}`
 			var compressed bytes.Buffer
-			zip := gzip.NewWriter(&compressed)
-			if _, err := zip.Write([]byte(`{"ok":true}`)); err != nil {
+			zip, err := gzip.NewWriterLevel(&compressed, gzip.NoCompression)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := zip.Write(bytes.Repeat([]byte("x"), 3<<20)); err != nil {
 				t.Fatal(err)
 			}
 			if err := zip.Close(); err != nil {
@@ -265,11 +273,11 @@ func TestProxyTransport(t *testing.T) {
 			}))
 			t.Cleanup(upstream.Close)
 			s := newTestServer(t)
-			s.proxyHTTPClient = upstream.Client()
+			s.proxyHTTPClient = proxyTestHTTPClient(t, upstream)
 			account := s.createTestAccount(t, "transport.pds.test")
 			cache := identity.NewMemCache(10)
 			if err := cache.PutDoc("did:web:appview.test", &identity.DidDoc{
-				Id: "did:web:appview.test", Service: []identity.DidDocService{{Id: "#view", ServiceEndpoint: upstream.URL}},
+				Id: "did:web:appview.test", Service: []identity.DidDocService{{Id: "#view", ServiceEndpoint: "https://203.0.113.10"}},
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -311,7 +319,7 @@ func TestProxyTransport(t *testing.T) {
 				t.Fatal(err)
 			}
 			if resp.StatusCode != 200 || resp.Uncompressed || resp.Header.Get("Content-Encoding") != "gzip" || resp.ContentLength != int64(compressed.Len()) || !bytes.Equal(raw, compressed.Bytes()) {
-				t.Fatalf("gzip response changed: status=%d headers=%v length=%d body=%x", resp.StatusCode, resp.Header, resp.ContentLength, raw)
+				t.Fatalf("gzip response changed: status=%d headers=%v length=%d bytes=%d", resp.StatusCode, resp.Header, resp.ContentLength, len(raw))
 			}
 			got := <-seen
 			wantBody, wantLength := "", int64(0)
@@ -320,6 +328,254 @@ func TestProxyTransport(t *testing.T) {
 			}
 			if got.err != nil || got.body != wantBody || got.length != wantLength || got.encoding != "gzip" {
 				t.Fatalf("upstream request changed: %+v", got)
+			}
+		})
+	}
+}
+
+func proxyTestHTTPClient(t *testing.T, upstream *httptest.Server) *http.Client {
+	t.Helper()
+	roots := x509.NewCertPool()
+	roots.AddCert(upstream.Certificate())
+	client := newProxyHTTPClient(
+		gttp.WithTLSConfig(&tls.Config{RootCAs: roots, ServerName: "example.com"}),
+		gttp.WithDialContext(func(ctx context.Context, network, address string) (net.Conn, error) {
+			// Map only approved logical public IPs to the disposable TLS server.
+			if address != "203.0.113.10:443" && address != "203.0.113.10:8443" && address != "203.0.113.11:443" {
+				return nil, fmt.Errorf("unexpected dial: %s", address)
+			}
+			return (&net.Dialer{}).DialContext(ctx, network, upstream.Listener.Addr().String())
+		}),
+	)
+	t.Cleanup(client.CloseIdleConnections)
+	return client
+}
+
+func proxyTransportContext(t *testing.T, endpoint, method string) (*Server, echo.Context, *httptest.ResponseRecorder) {
+	t.Helper()
+	s := newTestServer(t)
+	cache := identity.NewMemCache(10)
+	if err := cache.PutDoc("did:web:appview.test", &identity.DidDoc{
+		Id: "did:web:appview.test", Service: []identity.DidDocService{{Id: "#view", ServiceEndpoint: endpoint}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.passport = identity.NewPassport(nil, cache)
+	s.config.FallbackProxy = "did:web:appview.test#view"
+	e, w := newRequestContext("GET", "/xrpc/"+method+"?feed=at://did:web:owner.test/app.bsky.feed.generator/test", "", nil)
+	e.Set("credentialKind", credentialLegacyAccess)
+	return s, e, w
+}
+
+func TestProxyDefaultTransportBlocksPrivateTargets(t *testing.T) {
+	for _, method := range []string{"app.bsky.feed.getTimeline", "app.bsky.feed.getFeed"} {
+		t.Run(method, func(t *testing.T) {
+			var connections atomic.Int32
+			upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.WriteString(w, `{"value":{"$type":"app.bsky.feed.generator","did":"did:web:generator.test"}}`)
+			}))
+			upstream.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateNew {
+					connections.Add(1)
+				}
+			}
+			upstream.StartTLS()
+			t.Cleanup(upstream.Close)
+			for _, endpoint := range []string{upstream.URL, strings.Replace(upstream.URL, "127.0.0.1", "localhost", 1)} {
+				s, e, w := proxyTransportContext(t, endpoint, method)
+				if method == "app.bsky.feed.getFeed" {
+					_ = s.handleProxyBskyFeedGetFeed(e)
+					if w.Code != 500 {
+						t.Errorf("private feed lookup: status %d", w.Code)
+					}
+				} else if err := s.handleProxy(e); !errors.Is(err, gttp.ErrBlockedByIPPolicy) {
+					t.Errorf("expected IP-policy rejection, got %v", err)
+				}
+			}
+			if connections.Load() != 0 {
+				t.Fatalf("private service received %d connections", connections.Load())
+			}
+		})
+	}
+}
+
+func TestProxyCancellation(t *testing.T) {
+	for _, method := range []string{"app.bsky.feed.getTimeline", "app.bsky.feed.getFeed"} {
+		for _, stage := range []string{"headers", "body"} {
+			t.Run(method+"/"+stage, func(t *testing.T) {
+				entered, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+				upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if stage == "body" {
+						w.Header().Set("Content-Type", "application/json")
+						io.WriteString(w, "{")
+						w.(http.Flusher).Flush()
+					}
+					close(entered)
+					select {
+					case <-r.Context().Done():
+						close(cancelled)
+					case <-release:
+					}
+				}))
+				t.Cleanup(upstream.Close)
+				s, e, _ := proxyTransportContext(t, "https://203.0.113.10", method)
+				s.proxyHTTPClient = proxyTestHTTPClient(t, upstream)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				e.SetRequest(e.Request().WithContext(ctx))
+				done := make(chan struct{})
+				t.Cleanup(func() {
+					cancel()
+					close(release)
+					<-done
+				})
+				go func() {
+					defer close(done)
+					if method == "app.bsky.feed.getFeed" {
+						_ = s.handleProxyBskyFeedGetFeed(e)
+					} else {
+						_ = s.handleProxy(e)
+					}
+				}()
+				select {
+				case <-entered:
+				case <-time.After(2 * time.Second):
+					t.Fatal("upstream was not reached")
+				}
+				cancel()
+				select {
+				case <-cancelled:
+				case <-time.After(2 * time.Second):
+					t.Error("incoming cancellation did not reach upstream")
+				}
+				select {
+				case <-done:
+				case <-time.After(4 * time.Second):
+					t.Fatal("proxy did not return after cancellation")
+				}
+			})
+		}
+	}
+}
+
+func TestProxyRedirectPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, target string
+		wantErr      error
+		wantAuth     string
+	}{
+		{"same origin", "/done", nil, "Bearer test"},
+		{"other origin", "https://203.0.113.11/done", nil, ""},
+		{"private", "https://127.0.0.1/done", gttp.ErrBlockedByIPPolicy, ""},
+		{"downgrade", "http://203.0.113.10/done", gttp.ErrSchemeDowngrade, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.URL.Path != "/done" {
+					http.Redirect(w, r, tc.target, http.StatusFound)
+					return
+				}
+				io.WriteString(w, r.Header.Get("Authorization"))
+			}))
+			t.Cleanup(upstream.Close)
+			client := proxyTestHTTPClient(t, upstream)
+			req, err := http.NewRequest("GET", "https://203.0.113.10/start", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer test")
+			resp, err := client.Do(req)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) || calls.Load() != 1 {
+					t.Fatalf("redirect: calls=%d error=%v, want %v", calls.Load(), err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || string(body) != tc.wantAuth || calls.Load() != 2 {
+				t.Fatalf("redirect: calls=%d body=%q error=%v", calls.Load(), body, err)
+			}
+		})
+	}
+}
+
+func TestProxyRedirectDoesNotRestoreAuthorization(t *testing.T) {
+	for _, last := range []string{"/last", "https://203.0.113.10/last"} {
+		t.Run(last, func(t *testing.T) {
+			seen := make(chan string, 3)
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seen <- r.Header.Get("Authorization")
+				switch r.URL.Path {
+				case "/start":
+					http.Redirect(w, r, "https://203.0.113.10:8443/first", http.StatusFound)
+				case "/first":
+					http.Redirect(w, r, last, http.StatusFound)
+				case "/last":
+					io.WriteString(w, "ok")
+				}
+			}))
+			t.Cleanup(upstream.Close)
+			client := proxyTestHTTPClient(t, upstream)
+			req, err := http.NewRequest("GET", "https://203.0.113.10/start", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer test")
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || string(body) != "ok" || len(seen) != 3 {
+				t.Fatalf("redirect chain failed: calls=%d body=%q error=%v", len(seen), body, err)
+			}
+			for i, want := range []string{"Bearer test", "", ""} {
+				if got := <-seen; got != want {
+					t.Errorf("hop %d authorization = %q, want %q", i, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestProxyDeadline(t *testing.T) {
+	for _, stage := range []string{"headers", "body"} {
+		t.Run(stage, func(t *testing.T) {
+			release := make(chan struct{})
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if stage == "body" {
+					w.WriteHeader(200)
+					w.(http.Flusher).Flush()
+				}
+				select {
+				case <-r.Context().Done():
+				case <-release:
+				}
+			}))
+			t.Cleanup(upstream.Close)
+			t.Cleanup(func() { close(release) })
+			client := proxyTestHTTPClient(t, upstream)
+			if client.Timeout != 30*time.Second {
+				t.Fatalf("proxy deadline = %v, want 30s", client.Timeout)
+			}
+			client.Timeout = 100 * time.Millisecond
+			resp, err := client.Get("https://203.0.113.10/stall")
+			if stage == "body" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer resp.Body.Close()
+				_, err = io.ReadAll(resp.Body)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("expected deadline while reading %s, got %v", stage, err)
 			}
 		})
 	}
