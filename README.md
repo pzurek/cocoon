@@ -149,6 +149,23 @@ Failed S3 uploads receive best-effort cleanup. Objects are retained when a
 database commit's outcome is uncertain, to avoid deleting committed data. This
 is not crash-safe garbage collection or an aggregate storage quota.
 
+#### Signing-Key Reservations
+
+The public migration endpoint accepts JSON bodies up to 16 KiB. New key
+generation is limited to one per second with a burst of five per server process,
+independent of proxy/IP headers. It returns HTTP 429 when that allowance is
+exhausted. Admission stops at 10,000 stored reservations per database (HTTP 503);
+existing DID reservations remain reusable at either limit. All writers must run
+the bounded implementation for the database-wide ceiling to hold.
+
+Reserved private keys **do not expire**: a migrating DID may already publish one
+before account creation finishes. Failed migrations retain them, and successful
+creation removes only the consumed reservation after the same private key is
+stored in the account. Preserve/export key material before any manual cleanup;
+age alone is not evidence that deletion is safe. A public caller can eventually
+fill the bounded pool, denying new reservations; limits prevent unbounded growth,
+not all denial of service. Existing databases above the ceiling are not truncated.
+
 #### S3 Storage
 
 Cocoon supports S3-compatible storage for both database backups (SQLite only) and blob storage (images, videos, etc.):

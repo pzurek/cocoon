@@ -144,23 +144,20 @@ func (s *Server) handleCreateAccount(e echo.Context) error {
 	// TODO: unsupported domains
 
 	var k *atcrypto.PrivateKeyK256
+	var reservedKey *models.ReservedKey
 
 	if signupDid != "" {
-		reservedKey, err := s.getReservedKey(ctx, signupDid)
+		var err error
+		reservedKey, err = s.getReservedKey(ctx, signupDid)
 		if err != nil {
 			logger.Error("error looking up reserved key", "error", err)
+			return helpers.ServerError(e, nil)
 		}
 		if reservedKey != nil {
 			k, err = atcrypto.ParsePrivateBytesK256(reservedKey.PrivateKey)
 			if err != nil {
 				logger.Error("error parsing reserved key", "error", err)
-				k = nil
-			} else {
-				defer func() {
-					if delErr := s.deleteReservedKey(ctx, reservedKey.KeyDid, reservedKey.Did); delErr != nil {
-						logger.Error("error deleting reserved key", "error", delErr)
-					}
-				}()
+				return helpers.ServerError(e, nil)
 			}
 		}
 	}
@@ -266,6 +263,14 @@ func (s *Server) handleCreateAccount(e echo.Context) error {
 	if err != nil {
 		logger.Error("error creating new session", "error", err)
 		return helpers.ServerError(e, nil)
+	}
+
+	// A reservation may already be the DID's published key. Remove only the
+	// consumed key, and only after an identical durable account copy exists.
+	if reservedKey != nil {
+		if err := s.db.Exec(ctx, "DELETE FROM reserved_keys WHERE key_did = ? AND EXISTS (SELECT 1 FROM repos WHERE did = ? AND signing_key = ?)", nil, reservedKey.KeyDid, signupDid, reservedKey.PrivateKey).Error; err != nil {
+			logger.Error("error deleting consumed reserved key", "error", err)
+		}
 	}
 
 	go func() {

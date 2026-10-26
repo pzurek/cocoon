@@ -1,14 +1,17 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
 	"github.com/haileyok/cocoon/identity"
+	"github.com/haileyok/cocoon/models"
 )
 
 func TestCreateAccountStaging(t *testing.T) {
@@ -61,6 +64,22 @@ func TestCreateAccountStaging(t *testing.T) {
 			}
 			if existingDID {
 				request["did"] = did
+				reserved := models.ReservedKey{KeyDid: pub.DIDKey(), Did: &did, PrivateKey: k.Bytes(), CreatedAt: time.Now().Add(-time.Hour)}
+				sibling := models.ReservedKey{KeyDid: "legacy-sibling", Did: &did, PrivateKey: []byte("preserve"), CreatedAt: time.Now()}
+				if err := s.db.Client().Create(&[]models.ReservedKey{reserved, sibling}).Error; err != nil {
+					t.Fatal(err)
+				}
+				request["password"] = strings.Repeat("x", 73)
+				badBody, _ := json.Marshal(request)
+				c, rec := newRequestContext(http.MethodPost, "/xrpc/com.atproto.server.createAccount", string(badBody), map[string]string{"authorization": "Bearer " + tok})
+				if err := s.handleCreateAccount(c); err != nil || rec.Code != 500 {
+					t.Fatalf("expected password-hashing failure: %d %v", rec.Code, err)
+				}
+				var kept models.ReservedKey
+				if err := s.db.Client().Where("key_did = ?", reserved.KeyDid).First(&kept).Error; err != nil || !bytes.Equal(kept.PrivateKey, k.Bytes()) {
+					t.Fatalf("failed migration discarded reserved private key: %v", err)
+				}
+				request["password"] = "correct-horse-battery-staple"
 			}
 			body, err := json.Marshal(request)
 			if err != nil {
@@ -92,6 +111,15 @@ func TestCreateAccountStaging(t *testing.T) {
 			urepo, err := s.getRepoActorByDid(context.Background(), did)
 			if err != nil {
 				t.Fatalf("getRepoActorByDid: %v", err)
+			}
+			if existingDID {
+				if !bytes.Equal(urepo.SigningKey, k.Bytes()) {
+					t.Fatal("migration did not preserve the reserved signing key")
+				}
+				var remaining []models.ReservedKey
+				if err := s.db.Client().Find(&remaining).Error; err != nil || len(remaining) != 1 || remaining[0].KeyDid != "legacy-sibling" {
+					t.Fatalf("cleanup must remove only the consumed reservation: %v, %v", remaining, err)
+				}
 			}
 			if urepo.Repo.Rev == "" {
 				t.Fatal("repo has no rev after account creation via the existing-DID flow")

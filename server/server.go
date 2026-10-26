@@ -49,6 +49,7 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/lestrrat-go/jwx/v2/jwk"
 	slogecho "github.com/samber/slog-echo"
+	"golang.org/x/time/rate"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -96,7 +97,8 @@ type Server struct {
 	// registered by tapping them. Nil when no Yubico API key is configured.
 	yubiCloud *yubicloud.Client
 
-	repoWriteLocks sync.Map // DID -> *sync.Mutex; shared by writes and imports.
+	repoWriteLocks     sync.Map      // DID -> *sync.Mutex; shared by writes and imports.
+	reservationLimiter *rate.Limiter // guarded by the reserved-keys write lock.
 
 	// spaceJobs tracks background Spaces work (notification fan-out).
 	spaceJobs sync.WaitGroup
