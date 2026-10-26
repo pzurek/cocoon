@@ -23,12 +23,15 @@ func TestCLIProcess(t *testing.T) {
 	if os.Getenv("COCOON_TEST_CLI_PROCESS") != "1" {
 		return
 	}
+	if version := os.Getenv("COCOON_TEST_CLI_VERSION"); version != "" {
+		Version = version
+	}
 	os.Args = append([]string{"cocoon"}, os.Args[3:]...)
 	main()
 }
 
 func TestCLILifecycle(t *testing.T) {
-	for _, mode := range []string{"sigterm", "sigint", "bind-failure"} {
+	for _, mode := range []string{"sigterm", "sigint", "bind-failure", "browser-dev", "browser-production"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			assets, err := filepath.Abs("../../server")
@@ -83,6 +86,9 @@ func TestCLILifecycle(t *testing.T) {
 				}
 			}
 			cmd.Env = append(cmd.Env, "COCOON_TEST_CLI_PROCESS=1")
+			if mode == "browser-production" {
+				cmd.Env = append(cmd.Env, "COCOON_TEST_CLI_VERSION=test-release")
+			}
 			output, err := os.Create(filepath.Join(dir, "output"))
 			if err != nil {
 				t.Fatal(err)
@@ -107,6 +113,9 @@ func TestCLILifecycle(t *testing.T) {
 						t.Fatalf("CLI exited before listening: %v\n%s", err, logs)
 					case <-time.After(10 * time.Millisecond):
 					}
+				}
+				if strings.HasPrefix(mode, "browser-") {
+					checkCLIBrowserCookies(t, addr, filepath.Join(dir, "test.db"), mode == "browser-production")
 				}
 				signal := syscall.SIGTERM
 				if mode == "sigint" {
