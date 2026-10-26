@@ -1,9 +1,28 @@
 package server
 
-import "github.com/labstack/echo/v4"
+import (
+	"strings"
+
+	"github.com/labstack/echo/v4"
+)
 
 // addSpaceRoutes registers the Spaces (permissioned data) methods.
 func (s *Server) addSpaceRoutes() {
+	if s.config.DisableSpaces {
+		// Echo routes RawPath, but the proxy interprets decoded Path. Check
+		// before routing so encoded names cannot escape into the XRPC proxy.
+		s.echo.Pre(func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(e echo.Context) error {
+				path := e.Request().URL.Path
+				if strings.HasPrefix(path, "/xrpc/com.atproto.space.") || strings.HasPrefix(path, "/xrpc/com.atproto.simplespace.") {
+					return echo.ErrNotFound
+				}
+				return next(e)
+			}
+		})
+		return
+	}
+
 	session := []echo.MiddlewareFunc{s.handleLegacySessionMiddleware, s.handleOauthSessionMiddleware}
 
 	// record writes: the caller's own repo

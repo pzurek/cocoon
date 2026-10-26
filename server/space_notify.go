@@ -507,6 +507,9 @@ type spaceWorker struct {
 
 // startSpaceWorkers starts the notification retry worker.
 func (s *Server) startSpaceWorkers() {
+	if s.config.DisableSpaces {
+		return
+	}
 	s.spaceWorker.once.Do(func() {
 		s.spaceWorker.stop = make(chan struct{})
 		s.spaceWorker.done = make(chan struct{})

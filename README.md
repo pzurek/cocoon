@@ -302,6 +302,13 @@ Just because something is implemented doesn't mean it is finished. Tons of these
 
 Cocoon implements the ATProto Spaces alpha. See [docs/spaces.md](docs/spaces.md).
 
+Set `COCOON_SPACES_ENABLED=false` (or `--spaces-enabled=false` before `run`)
+to disable both Spaces namespaces and background notification retries. Spaces
+remain enabled by default. Disabled methods return 404 instead of falling through
+to the XRPC proxy. Existing Spaces data is retained and migrations still run, so
+re-enabling does not discard memberships, records or pending notifications. This
+switch does not control automatic PLC KEM-key backfill or account key creation.
+
 - [x] `com.atproto.space.createRecord`, `putRecord`, `deleteRecord`, `applyWrites`
 - [x] `com.atproto.space.getRecord`, `listRecords`, `listRepoOps`, `getLatestCommit`, `getRepo`, `listSpaces`
 - [x] `com.atproto.space.getBlob`, `listBlobs`

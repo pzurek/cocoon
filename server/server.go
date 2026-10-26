@@ -144,6 +144,7 @@ type Args struct {
 	Relays          []string
 	AdminPassword   string
 	RequireInvite   bool
+	DisableSpaces   bool
 
 	SmtpUser  string
 	SmtpPass  string
@@ -182,6 +183,7 @@ type config struct {
 	Relays            []string
 	AdminPassword     string
 	RequireInvite     bool
+	DisableSpaces     bool
 	SmtpEmail         string
 	SmtpName          string
 	SessionCookieKey  string
@@ -506,6 +508,7 @@ func New(args *Args) (*Server, error) {
 			Relays:            args.Relays,
 			AdminPassword:     args.AdminPassword,
 			RequireInvite:     args.RequireInvite,
+			DisableSpaces:     args.DisableSpaces,
 			SmtpName:          args.SmtpName,
 			SmtpEmail:         args.SmtpEmail,
 			SessionCookieKey:  args.SessionCookieKey,
