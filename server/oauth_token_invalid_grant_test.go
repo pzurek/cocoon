@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
@@ -15,9 +14,7 @@ import (
 
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/golang-jwt/jwt/v4"
-	"github.com/haileyok/cocoon/oauth/constants"
 	"github.com/haileyok/cocoon/oauth/provider"
-	"github.com/lestrrat-go/jwx/v2/jwk"
 )
 
 // postOauthToken drives /oauth/token through the full router with a fresh
@@ -305,42 +302,12 @@ func TestOauthRefreshRechecksAfterScopeResolution(t *testing.T) {
 				sessionLifetime, refreshLifetime := 14*24*time.Hour, 14*24*time.Hour
 				if method == "private_key_jwt" {
 					sessionLifetime, refreshLifetime = 730*24*time.Hour, 90*24*time.Hour
-					key, err := jwk.FromRaw(s.privateKey.Public())
-					if err != nil {
-						t.Fatal(err)
-					}
-					if err := key.Set(jwk.KeyIDKey, "refresh-client"); err != nil {
-						t.Fatal(err)
-					}
-					metadata := map[string]any{
-						"redirect_uris": []string{"https://example.com/callback"}, "response_types": []string{"code"},
-						"grant_types": []string{"authorization_code", "refresh_token"}, "scope": "atproto",
-						"application_type": "web", "token_endpoint_auth_method": method,
-						"token_endpoint_auth_signing_alg": "ES256", "dpop_bound_access_tokens": true,
-						"jwks": map[string]any{"keys": []any{key}},
-					}
-					clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						w.Header().Set("Content-Type", "application/json")
-						_ = json.NewEncoder(w).Encode(metadata)
-					}))
-					t.Cleanup(clientServer.Close)
-					auth.ClientId = clientServer.URL + "/client-metadata.json"
-					metadata["client_id"] = auth.ClientId
-					assertion := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
-						"iss": auth.ClientId, "sub": auth.ClientId, "aud": "https://" + testHostname,
-						"iat": time.Now().Unix(), "jti": "refresh-assertion",
-					})
-					assertion.Header["kid"] = "refresh-client"
-					signed, err := assertion.SignedString(s.privateKey)
-					if err != nil {
-						t.Fatal(err)
-					}
-					form.Set("client_assertion_type", constants.ClientAssertionTypeJwtBearer)
-					form.Set("client_assertion", signed)
+					auth.ClientAuth = confidentialClientFixture(t, s, form, []string{"authorization_code", "refresh_token"})
+					auth.ClientId = form.Get("client_id")
 				}
 				form.Set("client_id", auth.ClientId)
 				token := provider.OauthToken{
-					ClientId: auth.ClientId, ClientAuth: provider.ClientAuth{Method: method}, Sub: account.Did,
+					ClientId: auth.ClientId, ClientAuth: auth.ClientAuth, Sub: account.Did,
 					Parameters: auth.Parameters, Token: "old-access", RefreshToken: "old-refresh",
 					ExpiresAt: time.Now().Add(-time.Hour), SessionVersion: 7,
 				}
