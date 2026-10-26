@@ -238,7 +238,30 @@ COCOON_S3_CDN_URL="https://cdn.example.com"
 - Without `COCOON_S3_CDN_URL`: Blobs are proxied through the PDS server
 - With `COCOON_S3_CDN_URL`: `getBlob` returns a 302 redirect to `{CDN_URL}/blobs/{did}/{cid}`
 
-> **Tip**: For Cloudflare R2, you can use the public bucket URL as the CDN URL. For AWS S3, you can use CloudFront or the S3 bucket URL directly if public access is enabled.
+**Retention and access policy:** ordinary record/account deletion and reference
+garbage collection do not delete S3 objects. Once blob metadata is removed,
+`getBlob` for an existing active account returns `BlobNotFound` without a
+redirect. This is not remote erasure or immutable retention: an already known
+public bucket/CDN URL, cached response, or downloaded copy can remain accessible.
+Automatic failed-upload cleanup may delete an unreferenced object, including a
+failed re-upload of a key whose metadata was previously collected. Cleanup is
+best-effort and can leave orphans after uncertain remote/database outcomes.
+There is no automatic general S3 orphan collector or indefinite-retention guarantee.
+
+Use a **private bucket with no public CDN URL** when access must follow PDS
+checks, particularly for Spaces attachments. Do not make a bucket public merely
+to enable redirects: the same configured bucket may also contain database
+backups with private keys. Any deliberately public distribution must expose only
+intended public content and must never expose backup prefixes or private blobs.
+Cocoon does not configure bucket policies, version retention, or CDN caches.
+
+Do not apply an age-only expiry rule to `blobs/`: old objects may still be
+referenced, and backups may need objects no longer present in the current DB.
+Before manual reclamation, stop writers, preserve a recoverable object inventory
+and database snapshot, reconcile public and Spaces references plus required
+backup history, and account for legacy nested keys and object versions. Reclamation
+beyond failed-upload cleanup, retention-policy changes and CDN purges are explicit
+operator actions; none is performed by an ordinary record deletion.
 
 #### PLC Directory
 
