@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/gttp"
-	"github.com/bluesky-social/indigo/api/agnostic"
+	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/atclient"
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/lexicon"
@@ -170,16 +170,20 @@ func (r *IndigoResolver) fetchLexicon(ctx context.Context, nsid syntax.NSID) (js
 	if err != nil {
 		return nil, err
 	}
+	if ident == nil || ident.DID != did {
+		return nil, fmt.Errorf("lexicon authority identity does not match %s", did)
+	}
 	client := atclient.NewAPIClient(ident.PDSEndpoint())
 	client.Client = r.httpClient
-	response, err := agnostic.RepoGetRecord(ctx, client, "", "com.atproto.lexicon.schema", did.String(), nsid.String())
+	proof, err := comatproto.SyncGetRecord(ctx, client, "com.atproto.lexicon.schema", did.String(), nsid.String())
 	if err != nil {
 		return nil, err
 	}
-	if response.Value == nil {
-		return nil, fmt.Errorf("empty lexicon record in response")
+	record, err := verifyLexiconProof(ctx, proof, ident, nsid)
+	if err != nil {
+		return nil, fmt.Errorf("invalid lexicon proof: %w", err)
 	}
-	return *response.Value, nil
+	return record, nil
 }
 
 func (r *IndigoResolver) lookup(nsid string) (cacheEntry, bool) {

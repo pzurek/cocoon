@@ -167,14 +167,23 @@ func TestLexiconSuppliedDirectoryPrivatePDS(t *testing.T) {
 func TestLexiconResolutionPublicFetch(t *testing.T) {
 	const did = "did:plc:abcdefghijklmnopqrstuvwx"
 	dns := lexiconTestDNS(t, did)
-	for _, mode := range []string{"permission-set", "space", "public redirect", "private redirect", "HTTP redirect", "IP redirect", "port redirect", "oversized", "cancel body", "deadline body"} {
+	for _, mode := range []string{"permission-set", "P256", "partial", "space", "space permissions", "space forged signature", "space permissions forged signature", "public redirect", "private redirect", "HTTP redirect", "IP redirect", "port redirect", "oversized", "cancel body", "deadline body", "unsigned JSON", "forged signature", "tampered commit", "wrong DID", "wrong path", "tampered record CID", "wrong ID", "wrong type", "wrong version", "missing defs", "missing commit", "missing MST", "missing record", "multiple roots", "bad prefix", "negative prefix"} {
 		t.Run(mode, func(t *testing.T) {
+			kind := "permission-set"
+			if mode == "space" || mode == "space forged signature" {
+				kind = "space"
+			}
+			fixtureMode := mode
+			if strings.HasSuffix(mode, "forged signature") {
+				fixtureMode = "forged signature"
+			}
+			proof, publicKey := lexiconProofFixture(t, kind, fixtureMode)
 			var requests atomic.Int32
 			started := make(chan struct{}, 1)
 			pds := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				requests.Add(1)
 				if req.URL.Path != "/record" {
-					if req.URL.Path != "/xrpc/com.atproto.repo.getRecord" || req.URL.Query().Get("repo") != did || req.URL.Query().Get("collection") != "com.atproto.lexicon.schema" || req.URL.Query().Get("rkey") != "com.example.lexicon" {
+					if req.URL.Path != "/xrpc/com.atproto.sync.getRecord" || req.URL.Query().Get("did") != did || req.URL.Query().Get("collection") != "com.atproto.lexicon.schema" || req.URL.Query().Get("rkey") != "com.example.lexicon" {
 						t.Errorf("wrong record request: %s", req.URL)
 					}
 					switch mode {
@@ -206,15 +215,16 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 					fmt.Fprintf(w, `{"padding":%q,`, strings.Repeat("x", helpers.SafeFetchClientMaxBodyBytes))
 					return
 				}
-				kind := "permission-set"
-				if mode == "space" {
-					kind = "space"
+				if mode == "unsigned JSON" {
+					fmt.Fprint(w, `{"value":{"lexicon":1,"id":"com.example.lexicon","defs":{"main":{"type":"permission-set","permissions":[]}}}}`)
+					return
 				}
-				fmt.Fprintf(w, `{"value":{"lexicon":1,"id":"com.example.lexicon","defs":{"main":{"type":%q,"name":"Example","key":"tid","collections":["com.example.record"],"permissions":[{"type":"permission","resource":"repo","collection":["com.example.record"],"action":["create"]}]}}}}`, kind)
+				w.Header().Set("Content-Type", "application/vnd.ipld.car")
+				_, _ = w.Write(proof)
 			}))
 			defer pds.Close()
 			plc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				fmt.Fprintf(w, `{"id":%q,"service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://public.example.com"}]}`, did)
+				fmt.Fprintf(w, `{"id":%q,"verificationMethod":[{"id":"#atproto","type":"Multikey","controller":%q,"publicKeyMultibase":%q}],"service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://public.example.com"}]}`, did, did, publicKey)
 			}))
 			defer plc.Close()
 			r := NewIndigoResolverWithPLCURL(plc.URL)
@@ -247,6 +257,25 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 			if mode == "deadline body" {
 				r.httpClient.Timeout = 100 * time.Millisecond
 			}
+			if mode == "space permissions forged signature" || mode == "space forged signature" {
+				var err error
+				if mode == "space permissions forged signature" {
+					_, err = r.ResolveSpacePermissions(ctx, "com.example.lexicon")
+				} else {
+					_, err = r.ResolveSpaceCollections(ctx, "com.example.lexicon")
+				}
+				if err == nil || !strings.Contains(err.Error(), "commit signature") || requests.Load() != 1 {
+					t.Fatalf("forged space proof: requests=%d error=%v", requests.Load(), err)
+				}
+				return
+			}
+			if mode == "space permissions" {
+				perms, err := r.ResolveSpacePermissions(ctx, "com.example.lexicon")
+				if err != nil || len(perms) != 1 || perms[0].Type != "com.example.group" {
+					t.Fatalf("space permissions=%v, error=%v", perms, err)
+				}
+				return
+			}
 			if mode == "space" {
 				cols, err := r.ResolveSpaceCollections(ctx, "com.example.lexicon")
 				if err != nil || len(cols) != 1 || cols[0] != "com.example.record" {
@@ -256,8 +285,8 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 			}
 			ps, err := r.ResolvePermissionSet(ctx, "com.example.lexicon")
 			switch mode {
-			case "permission-set", "public redirect":
-				if err != nil || len(ps.Permissions) != 1 || ps.Permissions[0].Resource != "repo" || ps.Permissions[0].Action[0] != "create" {
+			case "permission-set", "public redirect", "P256", "partial":
+				if err != nil || len(ps.Permissions) != 2 || ps.Permissions[0].Resource != "repo" || ps.Permissions[0].Action[0] != "create" {
 					t.Fatalf("permission-set=%+v, error=%v", ps, err)
 				}
 				before := requests.Load()
@@ -278,7 +307,11 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 				}
 			default:
 				if err == nil || requests.Load() != 1 {
-					t.Fatalf("unsafe redirect: error=%v, requests=%d", err, requests.Load())
+					t.Fatalf("unsafe response: error=%v, requests=%d", err, requests.Load())
+				}
+				before := requests.Load()
+				if _, cachedErr := r.ResolvePermissionSet(ctx, "com.example.lexicon"); cachedErr == nil || requests.Load() != before {
+					t.Fatalf("negative cache did not preserve rejection: %v", cachedErr)
 				}
 			}
 		})

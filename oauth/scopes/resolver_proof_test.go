@@ -1,0 +1,258 @@
+package scopes
+
+import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/bluesky-social/indigo/atproto/atcrypto"
+	"github.com/bluesky-social/indigo/atproto/atdata"
+	"github.com/bluesky-social/indigo/atproto/identity"
+	"github.com/bluesky-social/indigo/atproto/repo"
+	"github.com/bluesky-social/indigo/atproto/repo/mst"
+	"github.com/bluesky-social/indigo/atproto/syntax"
+	"github.com/ipfs/go-cid"
+	"github.com/ipld/go-car"
+	carutil "github.com/ipld/go-car/util"
+	"github.com/multiformats/go-multihash"
+)
+
+// Builds real signed repository proofs; corruptions retain every other layer
+// of the proof so failures cannot be mistaken for JSON/CAR decoding failures.
+func lexiconProofFixture(t *testing.T, kind, mode string) ([]byte, string) {
+	t.Helper()
+	return lexiconProofFixtureWithCBOR(t, kind, mode, nil)
+}
+
+func lexiconProofFixtureWithCBOR(t *testing.T, kind, mode string, mutate func(string, []byte) []byte) ([]byte, string) {
+	t.Helper()
+	var key atcrypto.PrivateKey
+	var err error
+	if mode == "P256" {
+		key, err = atcrypto.GeneratePrivateKeyP256()
+	} else {
+		key, err = atcrypto.GeneratePrivateKeyK256()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := key.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := atdata.UnmarshalJSON([]byte(fmt.Sprintf(`{"$type":"com.atproto.lexicon.schema","lexicon":1,"id":"com.example.lexicon","defs":{"main":{"type":%q,"name":"Example","key":"tid","collections":["com.example.record"],"permissions":[{"type":"permission","resource":"repo","collection":["com.example.record"],"action":["create"]},{"type":"permission","resource":"space","spaceType":"com.example.group","collection":["com.example.record"],"action":["create"]}]}}}`, kind)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch mode {
+	case "wrong ID":
+		doc["id"] = "com.example.other"
+	case "wrong type":
+		doc["$type"] = "com.example.other"
+	case "wrong version":
+		doc["lexicon"] = int64(2)
+	case "missing defs":
+		delete(doc, "defs")
+	case "missing type":
+		delete(doc, "$type")
+	case "missing permissions":
+		delete(doc["defs"].(map[string]any)["main"].(map[string]any), "permissions")
+	case "invalid declaration":
+		main := doc["defs"].(map[string]any)["main"].(map[string]any)
+		if kind == "space" {
+			main["name"] = ""
+		} else {
+			main["permissions"] = []any{map[string]any{"type": "not-permission", "resource": "repo"}}
+		}
+	}
+	record, err := atdata.MarshalCBOR(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutate != nil {
+		record = mutate("record", record)
+	}
+	prefix := cid.NewPrefixV1(cid.DagCBOR, multihash.SHA2_256)
+	recordCID, err := prefix.Sum(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode == "wrong codec" {
+		recordCID, err = cid.NewPrefixV1(cid.Raw, multihash.SHA2_256).Sum(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := "com.atproto.lexicon.schema/com.example.lexicon"
+	if mode == "wrong path" {
+		path = "com.atproto.lexicon.schema/com.example.other"
+	}
+	node := mst.NodeData{Entries: []mst.EntryData{{KeySuffix: []byte(path), Value: recordCID}}}
+	if mode == "bad prefix" {
+		node.Entries[0].PrefixLen = 999
+	}
+	if mode == "negative prefix" {
+		node.Entries[0].PrefixLen = -1
+	}
+	tree, treeCID, err := node.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutate != nil {
+		tree = mutate("MST", tree)
+		c, err := prefix.Sum(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		treeCID = &c
+	}
+	child, childCID := tree, *treeCID
+	partial := mode == "partial" || mode == "missing path node"
+	if partial {
+		// A genuine multi-level proof: the requested record is in the left
+		// child, while the unrelated right subtree is intentionally absent.
+		var parentKey string
+		for i := 0; ; i++ {
+			parentKey = fmt.Sprintf("com.example.z/other%d", i)
+			if mst.HeightForKey([]byte(parentKey)) == mst.HeightForKey([]byte(path))+1 {
+				break
+			}
+		}
+		absent, err := prefix.Sum([]byte("absent sibling"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		parent := mst.NodeData{Left: &childCID, Entries: []mst.EntryData{{KeySuffix: []byte(parentKey), Value: recordCID, Right: &absent}}}
+		tree, treeCID, err = parent.Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	commit := repo.Commit{DID: "did:plc:abcdefghijklmnopqrstuvwx", Version: 3, Rev: "3jzfcijpj2z2a", Data: *treeCID}
+	if mode == "wrong DID" {
+		commit.DID = "did:plc:zyxwvutsrqponmlkjihgfedc"
+	}
+	if mode == "forged signature" {
+		key, err = atcrypto.GeneratePrivateKeyK256()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := commit.Sign(key); err != nil {
+		t.Fatal(err)
+	}
+	if mode == "tampered commit" {
+		commit.Rev = "3jzfcijpj2z2b"
+	}
+	if mode == "unsigned commit" {
+		commit.Sig = nil
+	}
+	var commitBytes bytes.Buffer
+	if err := commit.MarshalCBOR(&commitBytes); err != nil {
+		t.Fatal(err)
+	}
+	if mutate != nil {
+		commitBytes = *bytes.NewBuffer(mutate("commit", commitBytes.Bytes()))
+	}
+	commitCID, err := prefix.Sum(commitBytes.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := []cid.Cid{commitCID}
+	if mode == "multiple roots" {
+		roots = append(roots, recordCID)
+	}
+	var header bytes.Buffer
+	if err := car.WriteHeader(&car.CarHeader{Version: 1, Roots: roots}, &header); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if mutate == nil {
+		out.Write(header.Bytes())
+	} else {
+		// Strip/rebuild the length-delimited header to mutate its CBOR too.
+		raw, err := carutil.LdRead(bufio.NewReader(&header))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := carutil.LdWrite(&out, mutate("header", raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, b := range []struct {
+		id   cid.Cid
+		data []byte
+		omit bool
+	}{
+		{commitCID, commitBytes.Bytes(), mode == "missing commit"},
+		{*treeCID, tree, mode == "missing MST"},
+		{recordCID, record, mode == "missing record"},
+		{childCID, child, !partial || mode == "missing path node"},
+	} {
+		if b.omit {
+			continue
+		}
+		if mode == "tampered record CID" && b.id == recordCID {
+			b.data = bytes.ReplaceAll(b.data, []byte("Example"), []byte("Forged!"))
+		}
+		if mode == "tampered MST CID" && b.id == *treeCID {
+			b.data = bytes.ReplaceAll(b.data, []byte("lexicon"), []byte("forgery"))
+		}
+		if err := carutil.LdWrite(&out, b.id.Bytes(), b.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return out.Bytes(), pub.Multibase()
+}
+
+func TestVerifyLexiconProof(t *testing.T) {
+	for _, kind := range []string{"permission-set", "space"} {
+		for mode, wantErr := range map[string]string{
+			"valid": "", "P256": "", "partial": "",
+			"forged signature": "commit signature", "tampered commit": "commit signature",
+			"unsigned commit": "empty commit signature", "wrong DID": "commit DID",
+			"wrong path": "record not included", "wrong ID": "document type, version, or ID",
+			"wrong type": "document type, version, or ID", "missing type": "document type, version, or ID",
+			"wrong version": "document type, version, or ID", "wrong codec": "block CID",
+			"tampered record CID": "content integrity", "tampered MST CID": "content integrity",
+			"missing defs": "invalid lexicon defs", "invalid declaration": "",
+			"missing commit": "missing commit", "missing MST": "could not find",
+			"missing record": "record not included", "missing path node": "record not included",
+			"multiple roots": "exactly one", "bad prefix": "prefix length", "negative prefix": "prefix length",
+			"missing key": "signing key", "missing permissions": "", "truncated": "",
+		} {
+			t.Run(kind+"/"+mode, func(t *testing.T) {
+				proof, pub := lexiconProofFixture(t, kind, mode)
+				ident := &identity.Identity{DID: syntax.DID("did:plc:abcdefghijklmnopqrstuvwx"), Keys: map[string]identity.VerificationMethod{
+					"atproto": {Type: "Multikey", PublicKeyMultibase: pub},
+				}}
+				if mode == "missing key" {
+					ident.Keys = nil
+				}
+				if mode == "missing permissions" && kind == "permission-set" {
+					wantErr = "permissions array"
+				}
+				if mode == "truncated" {
+					proof = proof[:len(proof)-10]
+					wantErr = "EOF"
+				}
+				if mode == "invalid declaration" {
+					wantErr = "invalid permission declaration"
+					if kind == "space" {
+						wantErr = "space type name"
+					}
+				}
+				record, err := verifyLexiconProof(t.Context(), proof, ident, "com.example.lexicon")
+				if wantErr == "" {
+					if err != nil || !bytes.Contains(record, []byte(`"id":"com.example.lexicon"`)) {
+						t.Fatalf("valid proof rejected: %s, %v", record, err)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), wantErr) || record != nil {
+					t.Fatalf("want %q rejection, record=%s error=%v", wantErr, record, err)
+				}
+			})
+		}
+	}
+}
