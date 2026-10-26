@@ -1,10 +1,11 @@
 package server
 
 import (
+	"sort"
+
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/haileyok/cocoon/internal/helpers"
 	"github.com/haileyok/cocoon/models"
-	"github.com/ipfs/go-cid"
 	"github.com/labstack/echo/v4"
 )
 
@@ -24,19 +25,10 @@ func (s *Server) handleSyncListBlobs(e echo.Context) error {
 
 	// TODO: add tid param
 	cursor := e.QueryParam("cursor")
-	limit, err := getLimitFromContext(e, 50)
-	if err != nil {
+	limit, err := getLimitFromContext(e, 500)
+	if err != nil || limit < 1 || limit > 1000 {
 		return helpers.InputError(e, nil)
 	}
-
-	cursorquery := ""
-
-	params := []any{did}
-	if cursor != "" {
-		params = append(params, cursor)
-		cursorquery = "AND created_at < ?"
-	}
-	params = append(params, limit)
 
 	urepo, err := s.getRepoActorByDid(ctx, did)
 	if err != nil {
@@ -48,38 +40,33 @@ func (s *Server) handleSyncListBlobs(e echo.Context) error {
 		return helpers.InputError(e, to.StringPtr("RepoDeactivated"))
 	}
 
-	var blobs []models.Blob
-	if err := s.db.Raw(ctx, "SELECT * FROM blobs WHERE did = ? "+cursorquery+" ORDER BY created_at DESC LIMIT ?", nil, params...).Scan(&blobs).Error; err != nil {
+	// Like the reference, list distinct public-record references, not uploads.
+	// This excludes temporary/space-only blobs and includes referenced blobs
+	// even when their payload has not yet arrived during a repository migration.
+	var records []models.Record
+	if err := s.db.Raw(ctx, "SELECT value FROM records WHERE did = ?", nil, did).Scan(&records).Error; err != nil {
 		logger.Error("error getting records", "error", err)
 		return helpers.ServerError(e, nil)
 	}
-
-	cstrs := make([]string, 0, len(blobs))
-	for _, b := range blobs {
-		if len(b.Cid) == 0 {
-			logger.Error("empty cid found", "blob", b)
-			continue
+	refs, err := countBlobRefs(records)
+	if err != nil {
+		logger.Error("error decoding blob references", "error", err)
+		return helpers.ServerError(e, nil)
+	}
+	cstrs := make([]string, 0, len(refs))
+	for c := range refs {
+		if value := c.String(); value > cursor {
+			cstrs = append(cstrs, value)
 		}
-		c, err := cid.Cast(b.Cid)
-		if err != nil {
-			logger.Error("error casting cid", "error", err)
-			continue
-		}
-		// Blobs only space records reference stay out of public sync.
-		if b.RefCount <= 0 {
-			if spaceOnly, err := s.isSpaceOnlyBlob(ctx, did, c); err != nil {
-				logger.Error("error checking blob references", "error", err)
-				return helpers.ServerError(e, nil)
-			} else if spaceOnly {
-				continue
-			}
-		}
-		cstrs = append(cstrs, c.String())
+	}
+	sort.Strings(cstrs)
+	if len(cstrs) > limit {
+		cstrs = cstrs[:limit]
 	}
 
 	var newcursor *string
-	if len(blobs) == 50 {
-		newcursor = &blobs[len(blobs)-1].CreatedAt
+	if len(cstrs) > 0 {
+		newcursor = &cstrs[len(cstrs)-1]
 	}
 
 	return e.JSON(200, ComAtprotoSyncListBlobsResponse{

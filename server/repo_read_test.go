@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
+	"net/url"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -183,6 +187,87 @@ func TestInactiveSyncCredentials(t *testing.T) {
 			}
 			if w.Code != 200 || status.Active || status.Status == nil || *status.Status != "deactivated" {
 				t.Fatalf("public status: %d %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestSyncListBlobsPagination(t *testing.T) {
+	for _, limit := range []string{"1", "2", "1000", ""} {
+		t.Run("limit="+limit, func(t *testing.T) {
+			s, account := endpointTestServer(t)
+			s.repoman = NewRepoMan(s)
+			other := s.createTestAccount(t, "other-blobs.pds.test")
+			count := 5
+			if limit == "" || limit == "1000" {
+				count = 1003
+			}
+			var want []string
+			// References, rather than upload order or timestamps, define the list.
+			for i := range count {
+				c, record := blobRecord(t, fmt.Sprintf("referenced-%d", i))
+				want = append(want, c.String())
+				insertTestRecord(t, s, account.Did, "app.bsky.feed.post", fmt.Sprint(i), map[string]any(record))
+				if i == 0 {
+					insertTestRecord(t, s, account.Did, "app.bsky.feed.post", "duplicate", map[string]any(record))
+				}
+			}
+			sort.Strings(want)
+			// Unreferenced uploads, incomplete uploads, another account's records,
+			// and space-only references must not enter public sync.
+			uploadTestBlob(t, s, account, "unreferenced")
+			if err := s.db.Create(t.Context(), &models.Blob{Did: account.Did}, nil).Error; err != nil {
+				t.Fatal(err)
+			}
+			private, record := blobRecord(t, "private")
+			insertTestRecord(t, s, other.Did, "app.bsky.feed.post", "foreign", map[string]any(record))
+			if err := s.db.Create(t.Context(), &models.SpaceRecordBlob{Did: account.Did, BlobCid: private.String(), RecordUri: "at://" + account.Did + "/com.example.private/one"}, nil).Error; err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			cursor := ""
+			for page := 0; ; page++ {
+				if page > count {
+					t.Fatal("pagination did not terminate")
+				}
+				w := httptest.NewRecorder()
+				s.echo.ServeHTTP(w, httptest.NewRequest("GET", "/xrpc/com.atproto.sync.listBlobs?did="+account.Did+"&limit="+limit+"&cursor="+url.QueryEscape(cursor), nil))
+				if w.Code != 200 {
+					t.Fatalf("list: %d %s", w.Code, w.Body.String())
+				}
+				var result ComAtprotoSyncListBlobsResponse
+				if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+					t.Fatal(err)
+				}
+				pageSize := map[string]int{"1": 1, "2": 2, "1000": 1000, "": 500}[limit]
+				remaining := len(want) - len(got)
+				if len(result.Cids) != min(pageSize, remaining) {
+					t.Fatalf("page size = %d; want %d", len(result.Cids), min(pageSize, remaining))
+				}
+				got = append(got, result.Cids...)
+				if len(result.Cids) == 0 {
+					if result.Cursor != nil {
+						t.Fatal("empty page returned a cursor")
+					}
+					break
+				}
+				if result.Cursor == nil || *result.Cursor != result.Cids[len(result.Cids)-1] {
+					t.Fatal("nonempty page cursor must be its last CID")
+				}
+				if *result.Cursor <= cursor {
+					t.Fatal("cursor did not advance")
+				}
+				cursor = *result.Cursor
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("listed CIDs: got %v; want %v", got, want)
+			}
+			for _, invalid := range []string{"0", "-1", "1001", "not-an-integer"} {
+				w := httptest.NewRecorder()
+				s.echo.ServeHTTP(w, httptest.NewRequest("GET", "/xrpc/com.atproto.sync.listBlobs?did="+account.Did+"&limit="+invalid, nil))
+				if w.Code != 400 {
+					t.Fatalf("invalid limit %q: %d", invalid, w.Code)
+				}
 			}
 		})
 	}
