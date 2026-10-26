@@ -1,13 +1,11 @@
 package server
 
 import (
-	"context"
 	"crypto/sha256"
 	"errors"
 	"io"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/aws/aws-sdk-go/aws"
@@ -18,6 +16,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/labstack/echo/v4"
 	"github.com/multiformats/go-multihash"
+	"gorm.io/gorm"
 )
 
 const (
@@ -110,52 +109,58 @@ func (s *Server) handleRepoUploadBlob(e echo.Context) error {
 		e.Response().Header().Set("Retry-After", "1")
 		return e.JSON(http.StatusServiceUnavailable, map[string]string{"error": "BlobIndexNotReady", "message": "legacy blob references are being indexed; retry this request"})
 	}
-	var refs int64
-	if err := s.db.Raw(ctx, "SELECT COUNT(*) FROM public_blob_refs WHERE did = ? AND blob_cid = ?", nil, urepo.Repo.Did, c.String()).Scan(&refs).Error; err != nil {
-		logger.Error("error reading blob references", "error", err)
-		return helpers.ServerError(e, nil)
-	}
-	blob := models.Blob{Did: urepo.Repo.Did, Cid: c.Bytes(), RefCount: int(refs), CreatedAt: s.repoman.clock.Next().String(), Storage: "sqlite"}
+	blob := models.Blob{Did: urepo.Repo.Did, Cid: c.Bytes(), CreatedAt: s.repoman.clock.Next().String(), Storage: "sqlite", QuotaBackend: s.uploadBlobBackend()}
 	s3Upload := s.s3Config != nil && s.s3Config.BlobstoreEnabled
-	commitPossible := false
 	if s3Upload {
 		blob.Storage = "s3"
-		svc, err := s.s3Client()
-		if err != nil {
-			return helpers.ServerError(e, nil)
+		var reused bool
+		// Persist the charge before any network write. A failed COMMIT may
+		// have committed: return without PUT, and let a retry reuse the charge.
+		if err := s.db.Client().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := lockBlobQuota(tx); err != nil {
+				return err
+			}
+			var err error
+			reused, err = s.admitBlobUpload(tx, blob, read)
+			return err
+		}); err != nil {
+			logger.Error("error reserving blob quota", "error", err)
+			return blobQuotaError(e, err)
 		}
-		var existing int64
-		if err := s.db.Client().WithContext(ctx).Model(&models.Blob{}).Where("did = ? AND cid = ? AND storage = ?", blob.Did, blob.Cid, "s3").Count(&existing).Error; err != nil {
-			return helpers.ServerError(e, nil)
-		}
-		key := s3BlobKey(blob.Did, c)
-		// The repository lock serializes same-CID publication and cleanup.
-		// Never remove an object backing an earlier successful upload.
-		if existing == 0 {
-			defer func() {
-				if commitPossible {
-					return
-				}
-				cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-				defer cancel()
-				if _, err := svc.DeleteObjectWithContext(cleanup, &s3.DeleteObjectInput{Bucket: aws.String(s.s3Config.Bucket), Key: aws.String(key)}); err != nil {
-					logger.Error("error removing failed S3 upload", "key", key, "error", err)
-				}
-			}()
-		}
-		if _, err := svc.PutObjectWithContext(ctx, &s3.PutObjectInput{Bucket: aws.String(s.s3Config.Bucket), Key: aws.String(key), Body: file}); err != nil {
-			logger.Error("error uploading blob to s3", "error", err)
-			return helpers.ServerError(e, nil)
+		if !reused {
+			svc, err := s.s3Client()
+			if err != nil {
+				return helpers.ServerError(e, nil)
+			}
+			// No failure cleanup/refund: an ambiguous PUT or metadata COMMIT
+			// can coexist with a successful publication by another process.
+			// Retaining both object and charge is conservative and retryable.
+			if _, err := svc.PutObjectWithContext(ctx, &s3.PutObjectInput{Bucket: aws.String(s.s3Config.Bucket), Key: aws.String(s3BlobKey(blob.Did, c)), Body: file}); err != nil {
+				logger.Error("error uploading blob to s3", "error", err)
+				return helpers.ServerError(e, nil)
+			}
 		}
 	}
 	if err := s.db.Transaction(ctx, func(tx *db.DB) error {
+		if err := lockBlobQuota(tx.Client()); err != nil {
+			return err
+		}
+		reused, err := s.admitBlobUpload(tx.Client(), blob, read)
+		if err != nil {
+			return err
+		}
+		if reused {
+			return nil
+		}
+		var refs int64
+		if err := tx.Raw(ctx, "SELECT COUNT(*) FROM public_blob_refs WHERE did = ? AND blob_cid = ?", nil, blob.Did, c.String()).Scan(&refs).Error; err != nil {
+			return err
+		}
+		blob.RefCount = int(refs)
 		if err := tx.Create(ctx, &blob, nil).Error; err != nil {
 			return err
 		}
 		if s3Upload {
-			// A COMMIT error may mean only its acknowledgment was lost.
-			// Retain the object once commit is possible, even on error.
-			commitPossible = true
 			return nil
 		}
 		buf := make([]byte, blockSize)
@@ -175,7 +180,7 @@ func (s *Server) handleRepoUploadBlob(e echo.Context) error {
 		}
 	}); err != nil {
 		logger.Error("error persisting blob", "error", err)
-		return helpers.ServerError(e, nil)
+		return blobQuotaError(e, err)
 	}
 
 	resp := ComAtprotoRepoUploadBlobResponse{}

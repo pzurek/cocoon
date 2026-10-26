@@ -451,6 +451,9 @@ func (s *Server) deleteSpace(ctx context.Context, ref space.Ref) error {
 	uri := ref.String()
 	var recipients []models.SpaceCredentialRecipient
 	err := s.db.Client().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockBlobQuota(tx); err != nil {
+			return err
+		}
 		st := s.spaceStore(tx, ref.Authority)
 		var err error
 		if recipients, err = st.activeRecipients(uri); err != nil {

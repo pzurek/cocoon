@@ -185,9 +185,58 @@ default and negative values are rejected. Larger uploads return `BlobTooLarge`.
 
 Uploads spool to temporary files before persistence, so provision temporary disk
 space for concurrent uploads. SQLite blob metadata and parts commit together.
-Failed S3 uploads receive best-effort cleanup. Objects are retained when a
-database commit's outcome is uncertain, to avoid deleting committed data. This
-is not crash-safe garbage collection or an aggregate storage quota.
+S3 uploads reserve a durable payload charge before PUT. A failed or uncertain
+PUT or metadata commit retains the charge and any object: automatic cleanup
+could otherwise delete a concurrent successful upload. Retrying the same
+DID/CID in the same storage namespace reuses its charge.
+
+#### Tracked Blob-Payload Quotas
+
+New payload admission defaults to **5 GiB per DID** and **100 GiB per database**.
+Set `COCOON_BLOB_ACCOUNT_QUOTA_BYTES` / `--blob-account-quota-bytes` and
+`COCOON_BLOB_SERVER_QUOTA_BYTES` / `--blob-server-quota-bytes` to positive byte
+counts to change those limits. Zero selects the default; negative values are
+invalid. Lowering limits does not delete existing payloads. Reusing an existing
+same-DID/CID payload in a proven storage namespace remains possible at or above
+the limit. Unbound legacy S3 metadata requires backfill before reuse; it cannot
+prove that the currently configured bucket contains the payload. All writers
+must run the quota-aware version with consistent limits for the database-wide
+admission guarantee to hold.
+
+Unreferenced uploads count immediately. Charges are unique per DID, CID and
+storage namespace; changing an S3 endpoint, region or bucket is a separate
+namespace. SQLite charges end only when the payload is transactionally deleted.
+**S3 charges survive record/account deletion, metadata GC, failed uploads and
+restarts. Deleting records or accounts does not reclaim that S3 quota.** There
+is no automatic refund or object-reclamation command; failed attempts can consume
+capacity even when no object was ultimately stored. Raise limits only after
+reviewing actual storage capacity and the retention policy below.
+
+Account exhaustion returns HTTP 400 `BlobQuotaExceeded`; database-wide exhaustion
+returns HTTP 503 `BlobStorageFull`. Incomplete or unknown legacy accounting
+returns HTTP 503 `BlobQuotaNotReady`. These errors do not promise a retry time.
+Reads and imports of record references remain available without charging missing
+payloads; upload requests do not perform account-wide S3 inventory scans.
+
+Existing databases with blobs need an explicit, resumable accounting backfill.
+Using the same database settings and the **original S3 storage configuration**,
+run `cocoon blob-quota-backfill --batch 100` repeatedly until its JSON reports
+`Complete: true`. Each invocation inventories at most 100 metadata rows and
+probes at most 100 unknown objects, sequentially, with five-second per-operation
+deadlines and no SDK retries. SQLite sizes come from stored parts. S3 probes
+honor canonical and legacy nested keys. Missing objects, permission failures and
+other unknown sizes remain unresolved, not zero; any unknown size blocks new
+payload growth under the database-wide quota. The command does not delete objects
+or modify identities. Its `Unknown` count also includes legacy storage namespaces
+not yet bound to the supplied original S3 configuration, even if their byte size
+is already known. Rehearse the migration on a disposable copy first.
+
+These are **logical tracked-payload quotas, not physical disk or bucket limits**.
+They exclude repository blocks/records, indexes, event logs, WAL/free pages,
+concurrent temporary upload/import data, backups, legacy duplicate payload copies,
+S3 versions and extra nested copies, externally written objects, and objects whose
+metadata disappeared before accounting was introduced. Monitor and provision
+those separately; the ledger cannot reconstruct an absent historical inventory.
 
 #### Signing-Key Reservations
 
@@ -243,9 +292,9 @@ garbage collection do not delete S3 objects. Once blob metadata is removed,
 `getBlob` for an existing active account returns `BlobNotFound` without a
 redirect. This is not remote erasure or immutable retention: an already known
 public bucket/CDN URL, cached response, or downloaded copy can remain accessible.
-Automatic failed-upload cleanup may delete an unreferenced object, including a
-failed re-upload of a key whose metadata was previously collected. Cleanup is
-best-effort and can leave orphans after uncertain remote/database outcomes.
+Failed uploads also retain their charge and any object rather than risk deleting
+another successful publication. This can leave charged orphan objects or charges
+for objects that never arrived. No automatic S3 cleanup or quota refund is performed.
 There is no automatic general S3 orphan collector or indefinite-retention guarantee.
 
 Use a **private bucket with no public CDN URL** when access must follow PDS
@@ -260,7 +309,7 @@ referenced, and backups may need objects no longer present in the current DB.
 Before manual reclamation, stop writers, preserve a recoverable object inventory
 and database snapshot, reconcile public and Spaces references plus required
 backup history, and account for legacy nested keys and object versions. Reclamation
-beyond failed-upload cleanup, retention-policy changes and CDN purges are explicit
+of objects or charges, retention-policy changes and CDN purges are explicit
 operator actions; none is performed by an ordinary record deletion.
 
 #### PLC Directory

@@ -683,6 +683,9 @@ func (rm *RepoMan) applyWrites(ctx context.Context, urepo models.Repo, writes []
 		},
 	}
 	write := func(tx *db.DB) error {
+		if err := lockBlobQuota(tx.Client()); err != nil {
+			return err
+		}
 		persisted := sqlite_blockstore.New(urepo.Did, tx)
 		for _, block := range bs.GetWriteLog() {
 			if err := persisted.Put(ctx, block); err != nil {
@@ -958,11 +961,10 @@ func replacePublicBlobRefs(ctx context.Context, tx *db.DB, record models.Record)
 func indexRecords(ctx context.Context, database *db.DB, did string, entries []models.Record) ([]lexutil.LexLink, error) {
 	var blobs []lexutil.LexLink
 	err := database.Transaction(ctx, func(tx *db.DB) error {
-		if tx.Client().Dialector.Name() == "sqlite" {
-			// Reserve write intent before reading a WAL snapshot; no rows change.
-			if err := tx.Exec(ctx, "UPDATE records SET rkey = rkey WHERE 1 = 0", nil).Error; err != nil {
-				return err
-			}
+		// Also supports direct indexRecords callers. Production outer writers
+		// acquire this gate before their block writes, avoiding lock inversion.
+		if err := lockBlobQuota(tx.Client()); err != nil {
+			return err
 		}
 		complete, err := advancePublicBlobIndex(ctx, tx, did)
 		if err != nil {
@@ -1034,11 +1036,7 @@ func indexRecords(ctx context.Context, database *db.DB, did string, entries []mo
 			if inSpaces > 0 {
 				continue
 			}
-			if err := tx.Exec(ctx, "DELETE FROM blob_parts WHERE blob_id IN (SELECT id FROM blobs WHERE did = ? AND cid = ? AND ref_count = 0)", nil, did, c.Bytes()).Error; err != nil {
-				return err
-			}
-			// S3 object cleanup remains separate from database reference accounting.
-			if err := tx.Exec(ctx, "DELETE FROM blobs WHERE did = ? AND cid = ? AND ref_count = 0", nil, did, c.Bytes()).Error; err != nil {
+			if err := deleteBlobPayloads(tx.Client(), did, c.Bytes()); err != nil {
 				return err
 			}
 		}

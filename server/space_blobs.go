@@ -107,10 +107,7 @@ func (st *spaceStore) gcBlobs(cids []string) error {
 		if inSpaces > 0 {
 			continue
 		}
-		if err := st.db.Exec("DELETE FROM blob_parts WHERE blob_id IN (SELECT id FROM blobs WHERE did = ? AND cid = ? AND ref_count <= 0)", st.did, c.Bytes()).Error; err != nil {
-			return err
-		}
-		if err := st.db.Exec("DELETE FROM blobs WHERE did = ? AND cid = ? AND ref_count <= 0", st.did, c.Bytes()).Error; err != nil {
+		if err := deleteBlobPayloads(st.db, st.did, c.Bytes()); err != nil {
 			return err
 		}
 	}

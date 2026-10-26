@@ -65,6 +65,8 @@ func newTestServer(t *testing.T) *Server {
 		&models.PublicBlobIndex{},
 		&models.Blob{},
 		&models.BlobPart{},
+		&models.BlobCharge{},
+		&models.BlobQuotaState{},
 		&models.ReservedKey{},
 		&models.TwoFactorCredential{},
 		&models.TwoFactorBackupCode{},
@@ -73,6 +75,9 @@ func newTestServer(t *testing.T) *Server {
 		&provider.OauthAuthorizationRequest{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
+	}
+	if err := initBlobQuota(gdb); err != nil {
+		t.Fatalf("migrate blob quota: %v", err)
 	}
 	if err := migrateSpaceTables(gdb, slog.Default()); err != nil {
 		t.Fatalf("migrate spaces: %v", err)

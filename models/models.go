@@ -211,6 +211,25 @@ type Blob struct {
 	Cid       []byte `gorm:"index;index:idx_blob_did_cid"`
 	RefCount  int
 	Storage   string `gorm:"default:sqlite"`
+	// QuotaBackend identifies the storage namespace; empty denotes legacy data.
+	QuotaBackend string
+}
+
+// BlobCharge outlives S3 metadata: absence of a row in blobs is not proof that
+// its object was deleted. Bytes == nil is unknown, never zero. No account FK.
+type BlobCharge struct {
+	Did     string `gorm:"primaryKey"`
+	Cid     []byte `gorm:"primaryKey"`
+	Backend string `gorm:"primaryKey"`
+	Bytes   *int64
+	// Failed probes move to the back of the bounded retry queue.
+	CheckedAt int64 `gorm:"not null;default:0;index"`
+}
+
+type BlobQuotaState struct {
+	ID       uint `gorm:"primaryKey;autoIncrement:false"`
+	LastID   uint
+	Complete bool
 }
 
 type BlobPart struct {

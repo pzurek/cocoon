@@ -89,6 +89,9 @@ func (s *Server) commitSpaceWrites(e echo.Context, did string, ref space.Ref, fn
 	var commit *spaceCommit
 	var writes []spaceWrite
 	err := s.db.Client().WithContext(e.Request().Context()).Transaction(func(tx *gorm.DB) error {
+		if err := lockBlobQuota(tx); err != nil {
+			return err
+		}
 		st := s.spaceStore(tx, did)
 		var err error
 		writes, err = fn(st)

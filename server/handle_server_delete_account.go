@@ -97,6 +97,10 @@ func (s *Server) handleServerDeleteAccount(e echo.Context) error {
 		}
 	}()
 
+	if err := lockBlobQuota(tx); err != nil {
+		logger.Error("error locking blob quota", "error", err)
+		return helpers.ServerError(e, nil)
+	}
 	if err := tx.Exec("DELETE FROM blocks WHERE did = ?", req.Did).Error; err != nil {
 		logger.Error("error deleting blocks", "error", err)
 		return helpers.ServerError(e, nil)
@@ -114,7 +118,7 @@ func (s *Server) handleServerDeleteAccount(e echo.Context) error {
 		}
 	}
 
-	if err := tx.Exec("DELETE FROM blobs WHERE did = ?", req.Did).Error; err != nil {
+	if err := deleteBlobPayloads(tx, req.Did, nil); err != nil {
 		logger.Error("error deleting blobs", "error", err)
 		return helpers.ServerError(e, nil)
 	}

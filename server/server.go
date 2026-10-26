@@ -136,24 +136,26 @@ type Server struct {
 type Args struct {
 	Logger *slog.Logger
 
-	LogLevel           slog.Level
-	Addr               string
-	DbName             string
-	DbType             string
-	DatabaseURL        string
-	Version            string
-	Did                string
-	Hostname           string
-	RotationKeyPath    string
-	JwkPath            string
-	ContactEmail       string
-	Relays             []string
-	AdminPassword      string
-	RequireInvite      bool
-	DisableSpaces      bool
-	KEMBackfillEnabled bool
-	BlobUploadLimit    int64
-	BackupDir          string
+	LogLevel              slog.Level
+	Addr                  string
+	DbName                string
+	DbType                string
+	DatabaseURL           string
+	Version               string
+	Did                   string
+	Hostname              string
+	RotationKeyPath       string
+	JwkPath               string
+	ContactEmail          string
+	Relays                []string
+	AdminPassword         string
+	RequireInvite         bool
+	DisableSpaces         bool
+	KEMBackfillEnabled    bool
+	BlobUploadLimit       int64
+	BlobAccountQuotaBytes int64
+	BlobServerQuotaBytes  int64
+	BackupDir             string
 
 	SmtpUser  string
 	SmtpPass  string
@@ -183,24 +185,26 @@ type Args struct {
 }
 
 type config struct {
-	LogLevel           slog.Level
-	Version            string
-	Did                string
-	Hostname           string
-	ContactEmail       string
-	EnforcePeering     bool
-	Relays             []string
-	AdminPassword      string
-	RequireInvite      bool
-	DisableSpaces      bool
-	KEMBackfillEnabled bool
-	BlobUploadLimit    int64
-	BackupDir          string
-	SmtpEmail          string
-	SmtpName           string
-	SessionCookieKey   string
-	BlockstoreVariant  BlockstoreVariant
-	FallbackProxy      string
+	LogLevel              slog.Level
+	Version               string
+	Did                   string
+	Hostname              string
+	ContactEmail          string
+	EnforcePeering        bool
+	Relays                []string
+	AdminPassword         string
+	RequireInvite         bool
+	DisableSpaces         bool
+	KEMBackfillEnabled    bool
+	BlobUploadLimit       int64
+	BlobAccountQuotaBytes int64
+	BlobServerQuotaBytes  int64
+	BackupDir             string
+	SmtpEmail             string
+	SmtpName              string
+	SessionCookieKey      string
+	BlockstoreVariant     BlockstoreVariant
+	FallbackProxy         string
 }
 
 type CustomValidator struct {
@@ -334,6 +338,15 @@ func New(args *Args) (*Server, error) {
 	}
 	if args.BlobUploadLimit == 0 {
 		args.BlobUploadLimit = DefaultBlobUploadLimit
+	}
+	if args.BlobAccountQuotaBytes < 0 || args.BlobServerQuotaBytes < 0 {
+		return nil, fmt.Errorf("blob quotas must not be negative")
+	}
+	if args.BlobAccountQuotaBytes == 0 {
+		args.BlobAccountQuotaBytes = DefaultBlobAccountQuotaBytes
+	}
+	if args.BlobServerQuotaBytes == 0 {
+		args.BlobServerQuotaBytes = DefaultBlobServerQuotaBytes
 	}
 
 	if args.Addr == "" {
@@ -542,24 +555,26 @@ func New(args *Args) (*Server, error) {
 		publicJwk:  publicJwk,
 		publicKid:  publicKid,
 		config: &config{
-			LogLevel:           args.LogLevel,
-			Version:            args.Version,
-			Did:                args.Did,
-			Hostname:           args.Hostname,
-			ContactEmail:       args.ContactEmail,
-			EnforcePeering:     false,
-			Relays:             args.Relays,
-			AdminPassword:      args.AdminPassword,
-			RequireInvite:      args.RequireInvite,
-			DisableSpaces:      args.DisableSpaces,
-			KEMBackfillEnabled: args.KEMBackfillEnabled,
-			BlobUploadLimit:    args.BlobUploadLimit,
-			BackupDir:          args.BackupDir,
-			SmtpName:           args.SmtpName,
-			SmtpEmail:          args.SmtpEmail,
-			SessionCookieKey:   args.SessionCookieKey,
-			BlockstoreVariant:  args.BlockstoreVariant,
-			FallbackProxy:      args.FallbackProxy,
+			LogLevel:              args.LogLevel,
+			Version:               args.Version,
+			Did:                   args.Did,
+			Hostname:              args.Hostname,
+			ContactEmail:          args.ContactEmail,
+			EnforcePeering:        false,
+			Relays:                args.Relays,
+			AdminPassword:         args.AdminPassword,
+			RequireInvite:         args.RequireInvite,
+			DisableSpaces:         args.DisableSpaces,
+			KEMBackfillEnabled:    args.KEMBackfillEnabled,
+			BlobUploadLimit:       args.BlobUploadLimit,
+			BlobAccountQuotaBytes: args.BlobAccountQuotaBytes,
+			BlobServerQuotaBytes:  args.BlobServerQuotaBytes,
+			BackupDir:             args.BackupDir,
+			SmtpName:              args.SmtpName,
+			SmtpEmail:             args.SmtpEmail,
+			SessionCookieKey:      args.SessionCookieKey,
+			BlockstoreVariant:     args.BlockstoreVariant,
+			FallbackProxy:         args.FallbackProxy,
 		},
 		evtman:        events.NewEventManager(evtPersister),
 		evtpersister:  evtPersister,
@@ -754,6 +769,8 @@ func (s *Server) Migrate() error {
 		&models.PublicBlobIndex{},
 		&models.Blob{},
 		&models.BlobPart{},
+		&models.BlobCharge{},
+		&models.BlobQuotaState{},
 		&models.ReservedKey{},
 		&models.TwoFactorCredential{},
 		&models.TwoFactorBackupCode{},
@@ -762,6 +779,9 @@ func (s *Server) Migrate() error {
 		&provider.OauthAuthorizationRequest{},
 	); err != nil {
 		errs = append(errs, fmt.Errorf("migration failed: %w", err))
+	}
+	if err := initBlobQuota(s.db.Client()); err != nil {
+		errs = append(errs, fmt.Errorf("blob quota migration failed: %w", err))
 	}
 	if err := migrateSpaceTables(s.db.Client(), s.logger); err != nil {
 		errs = append(errs, fmt.Errorf("space table migration failed; spaces will not work: %w", err))

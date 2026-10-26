@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 
@@ -109,20 +110,22 @@ func TestUploadBlobBoundsAndAtomicity(t *testing.T) {
 	}
 }
 
-func TestUploadBlobS3FailureCleanup(t *testing.T) {
+func TestUploadBlobS3ConservativeCharges(t *testing.T) {
 	for _, tc := range []struct {
 		name                                     string
 		oversize, failPut, failDB, prior, cancel bool
 		uncertainCommit                          bool
+		reservationCommit                        bool
 		want                                     int
 	}{
 		{name: "success", want: 200},
 		{name: "oversized", oversize: true, want: 400},
 		{name: "failed put after storing object", failPut: true, want: 500},
 		{name: "failed database insert", failDB: true, want: 500},
-		{name: "failed repeat preserves prior object", failDB: true, prior: true, want: 500},
+		{name: "repeat skips publication and preserves prior object", failDB: true, prior: true, want: 200},
 		{name: "canceled after storing object", cancel: true, want: 500},
 		{name: "commit acknowledgment lost", uncertainCommit: true, want: 500},
+		{name: "reservation acknowledgment lost prevents put", reservationCommit: true, want: 500},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newTestServer(t)
@@ -187,12 +190,19 @@ func TestUploadBlobS3FailureCleanup(t *testing.T) {
 			}))
 			defer endpoint.Close()
 			s.s3Config = &S3Config{BlobstoreEnabled: true, Bucket: "uploads", Region: "us-east-1", Endpoint: endpoint.URL, AccessKey: "test", SecretKey: "test"}
+			if tc.prior {
+				// Reuse requires proof that the previous upload belongs to this
+				// namespace, rather than ambiguous pre-quota S3 metadata.
+				if err := s.db.Client().Model(&models.Blob{}).Where("did = ? AND cid = ?", acct.Did, wantCID.Bytes()).Update("quota_backend", s.uploadBlobBackend()).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
 			c, w := newRequestContext(http.MethodPost, "/xrpc/com.atproto.repo.uploadBlob", "", nil)
 			c.Set("repo", mustRepoActor(t, s, acct.Did))
 			c.SetRequest(c.Request().WithContext(ctx))
 			c.Request().Body = io.NopCloser(bytes.NewReader(payload))
 			c.Request().ContentLength = -1
-			if tc.uncertainCommit {
+			if tc.uncertainCommit || tc.reservationCommit {
 				// Target blob publication's COMMIT, not the separate one-time
 				// legacy-index transaction that precedes any S3 publication.
 				if complete, err := s.preparePublicBlobIndex(ctx, acct.Did); err != nil || !complete {
@@ -202,7 +212,12 @@ func TestUploadBlobS3FailureCleanup(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				s.db.Client().Statement.ConnPool = commitErrorPool{sqlDB}
+				remaining := &atomic.Int64{}
+				remaining.Store(2)
+				if tc.reservationCommit {
+					remaining.Store(1)
+				}
+				s.db.Client().Statement.ConnPool = quotaCommitErrorPool{sqlDB, remaining}
 			}
 			if err := s.handleRepoUploadBlob(c); err != nil {
 				t.Fatal(err)
@@ -220,14 +235,65 @@ func TestUploadBlobS3FailureCleanup(t *testing.T) {
 				if !bytes.Equal(stored, payload) || len(blobs) != 1 || blobs[0].Storage != "s3" || !bytes.Equal(blobs[0].Cid, wantCID.Bytes()) {
 					t.Fatal("expected intact S3 object and matching metadata")
 				}
-			} else if len(stored) != 0 || len(blobs) != 0 {
-				t.Fatalf("failed upload retained %d object bytes and %d rows", len(stored), len(blobs))
+			} else {
+				if len(blobs) != 0 {
+					t.Fatalf("failed publication retained %d metadata rows", len(blobs))
+				}
+				if tc.oversize || tc.reservationCommit {
+					if len(stored) != 0 || requests != 0 {
+						t.Fatal("unadmitted publication reached S3")
+					}
+				} else if !bytes.Equal(stored, payload) {
+					t.Fatal("ambiguous publication deleted its object")
+				}
+			}
+			var charges []models.BlobCharge
+			if err := s.db.Client().Find(&charges).Error; err != nil {
+				t.Fatal(err)
+			}
+			if tc.oversize {
+				if len(charges) != 0 {
+					t.Fatal("oversized upload charged")
+				}
+			} else if len(charges) != 1 || charges[0].Bytes == nil || *charges[0].Bytes != int64(len(payload)) {
+				t.Fatalf("missing durable charge: %+v", charges)
 			}
 			if tc.oversize && requests != 0 {
 				t.Fatalf("oversized upload reached S3: %d requests", requests)
 			}
+			if tc.prior && requests != 0 {
+				t.Fatalf("same-namespace reuse reached S3: %d requests", requests)
+			}
 		})
 	}
+}
+
+type quotaCommitErrorPool struct {
+	*sql.DB
+	remaining *atomic.Int64
+}
+
+func (p quotaCommitErrorPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	tx, err := p.DB.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &quotaCommitErrorTx{tx, p.remaining}, nil
+}
+
+type quotaCommitErrorTx struct {
+	*sql.Tx
+	remaining *atomic.Int64
+}
+
+func (tx quotaCommitErrorTx) Commit() error {
+	if err := tx.Tx.Commit(); err != nil {
+		return err
+	}
+	if tx.remaining.Add(-1) == 0 {
+		return errors.New("commit acknowledgment lost")
+	}
+	return nil
 }
 
 // Model a database that commits successfully but loses the acknowledgment.
