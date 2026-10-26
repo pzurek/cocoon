@@ -84,6 +84,19 @@ func (s *Server) handleRepoImportRepo(e echo.Context) error {
 				return err
 			}
 		}
+		// Import replaces public references and their completeness marker in
+		// the same transaction as records/root/counts, under the repository lock.
+		if err := tx.Exec(ctx, "DELETE FROM public_blob_refs WHERE did = ?", nil, urepo.Repo.Did).Error; err != nil {
+			return err
+		}
+		for _, record := range records {
+			if _, err := replacePublicBlobRefs(ctx, tx, record); err != nil {
+				return err
+			}
+		}
+		if err := tx.Save(ctx, &models.PublicBlobIndex{Did: urepo.Repo.Did, Complete: true}, nil).Error; err != nil {
+			return err
+		}
 		if err := tx.Exec(ctx, "UPDATE blobs SET ref_count = 0 WHERE did = ?", nil, urepo.Repo.Did).Error; err != nil {
 			return err
 		}

@@ -193,6 +193,11 @@ func TestUploadBlobS3FailureCleanup(t *testing.T) {
 			c.Request().Body = io.NopCloser(bytes.NewReader(payload))
 			c.Request().ContentLength = -1
 			if tc.uncertainCommit {
+				// Target blob publication's COMMIT, not the separate one-time
+				// legacy-index transaction that precedes any S3 publication.
+				if complete, err := s.preparePublicBlobIndex(ctx, acct.Did); err != nil || !complete {
+					t.Fatalf("prepare public blob index: complete=%v err=%v", complete, err)
+				}
 				sqlDB, err := s.db.Client().DB()
 				if err != nil {
 					t.Fatal(err)

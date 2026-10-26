@@ -1,11 +1,10 @@
 package server
 
 import (
-	"sort"
+	"net/http"
 
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/haileyok/cocoon/internal/helpers"
-	"github.com/haileyok/cocoon/models"
 	"github.com/labstack/echo/v4"
 )
 
@@ -43,25 +42,33 @@ func (s *Server) handleSyncListBlobs(e echo.Context) error {
 	// Like the reference, list distinct public-record references, not uploads.
 	// This excludes temporary/space-only blobs and includes referenced blobs
 	// even when their payload has not yet arrived during a repository migration.
-	var records []models.Record
-	if err := s.db.Raw(ctx, "SELECT value FROM records WHERE did = ?", nil, did).Scan(&records).Error; err != nil {
-		logger.Error("error getting records", "error", err)
-		return helpers.ServerError(e, nil)
-	}
-	refs, err := countBlobRefs(records)
+	unlock := s.lockRepoWrite(did)
+	defer unlock()
+	// The pre-lock account snapshot may predate a completed deletion. A cold
+	// list mutates the index, so revalidate before allowing any backfill.
+	urepo, err = s.getRepoActorByDid(ctx, did)
 	if err != nil {
-		logger.Error("error decoding blob references", "error", err)
+		logger.Error("could not find user for requested blobs", "error", err)
+		return helpers.InputError(e, nil)
+	}
+	if !urepo.Active() && e.Get("inactiveRepoRead") != urepo.Repo.Did {
+		return helpers.InputError(e, to.StringPtr("RepoDeactivated"))
+	}
+	complete, err := s.preparePublicBlobIndex(ctx, did)
+	if err != nil {
+		logger.Error("error preparing blob references", "error", err)
 		return helpers.ServerError(e, nil)
 	}
-	cstrs := make([]string, 0, len(refs))
-	for c := range refs {
-		if value := c.String(); value > cursor {
-			cstrs = append(cstrs, value)
-		}
+	if !complete {
+		e.Response().Header().Set("Retry-After", "1")
+		return e.JSON(http.StatusServiceUnavailable, map[string]string{"error": "BlobIndexNotReady", "message": "legacy blob references are being indexed; retry this request"})
 	}
-	sort.Strings(cstrs)
-	if len(cstrs) > limit {
-		cstrs = cstrs[:limit]
+	// The DID/CID covering index seeks past even an exhausted cursor; no
+	// records, payloads, or earlier pages are read or decoded.
+	cstrs := make([]string, 0, limit)
+	if err := s.db.Raw(ctx, "SELECT DISTINCT blob_cid FROM public_blob_refs WHERE did = ? AND blob_cid > ? ORDER BY blob_cid LIMIT ?", nil, did, cursor, limit).Scan(&cstrs).Error; err != nil {
+		logger.Error("error getting blob references", "error", err)
+		return helpers.ServerError(e, nil)
 	}
 
 	var newcursor *string

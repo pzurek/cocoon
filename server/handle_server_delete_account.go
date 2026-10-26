@@ -9,6 +9,7 @@ import (
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/util"
 	"github.com/haileyok/cocoon/internal/helpers"
+	"github.com/haileyok/cocoon/models"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -33,6 +34,18 @@ func (s *Server) handleServerDeleteAccount(e echo.Context) error {
 		logger.Error("error validating", "error", err)
 		return helpers.ServerError(e, nil)
 	}
+
+	// This endpoint is unauthenticated. Do not retain a repository mutex for
+	// arbitrary nonexistent DIDs; the lookup under the lock is authoritative.
+	if _, err := s.getRepoActorByDid(ctx, req.Did); err != nil {
+		logger.Error("error getting repo", "error", err)
+		return echo.NewHTTPError(400, "account not found")
+	}
+
+	// Deletion must serialize with lazy index backfill and blob publication,
+	// not just ordinary repository writes. Keep the lock through COMMIT.
+	unlock := s.lockRepoWrite(req.Did)
+	defer unlock()
 
 	urepo, err := s.getRepoActorByDid(ctx, req.Did)
 	if err != nil {
@@ -92,6 +105,13 @@ func (s *Server) handleServerDeleteAccount(e echo.Context) error {
 	if err := tx.Exec("DELETE FROM records WHERE did = ?", req.Did).Error; err != nil {
 		logger.Error("error deleting records", "error", err)
 		return helpers.ServerError(e, nil)
+	}
+
+	for _, model := range []any{&models.PublicBlobRef{}, &models.PublicBlobIndex{}} {
+		if err := tx.Where("did = ?", req.Did).Delete(model).Error; err != nil {
+			logger.Error("error deleting public blob index", "error", err)
+			return helpers.ServerError(e, nil)
+		}
 	}
 
 	if err := tx.Exec("DELETE FROM blobs WHERE did = ?", req.Did).Error; err != nil {

@@ -91,17 +91,31 @@ func (s *Server) handleRepoUploadBlob(e echo.Context) error {
 
 	unlock := s.lockRepoWrite(urepo.Repo.Did)
 	defer unlock()
-	var records []models.Record
-	if err := s.db.Client().WithContext(ctx).Select("value").Where("did = ?", urepo.Repo.Did).Find(&records).Error; err != nil {
+	// Authentication and spooling precede this lock. Deletion may have
+	// committed meanwhile; never recreate index or payload rows for it.
+	urepo, err = s.getRepoActorByDid(ctx, urepo.Repo.Did)
+	if err != nil {
+		logger.Error("could not find upload account", "error", err)
+		return helpers.InputError(e, nil)
+	}
+	if urepo.Repo.TakenDown() {
+		return helpers.InputError(e, to.StringPtr("AccountTakedown"))
+	}
+	complete, err := s.preparePublicBlobIndex(ctx, urepo.Repo.Did)
+	if err != nil {
+		logger.Error("error preparing blob references", "error", err)
+		return helpers.ServerError(e, nil)
+	}
+	if !complete {
+		e.Response().Header().Set("Retry-After", "1")
+		return e.JSON(http.StatusServiceUnavailable, map[string]string{"error": "BlobIndexNotReady", "message": "legacy blob references are being indexed; retry this request"})
+	}
+	var refs int64
+	if err := s.db.Raw(ctx, "SELECT COUNT(*) FROM public_blob_refs WHERE did = ? AND blob_cid = ?", nil, urepo.Repo.Did, c.String()).Scan(&refs).Error; err != nil {
 		logger.Error("error reading blob references", "error", err)
 		return helpers.ServerError(e, nil)
 	}
-	refs, err := countBlobRefs(records)
-	if err != nil {
-		logger.Error("error decoding blob references", "error", err)
-		return helpers.ServerError(e, nil)
-	}
-	blob := models.Blob{Did: urepo.Repo.Did, Cid: c.Bytes(), RefCount: refs[c], CreatedAt: s.repoman.clock.Next().String(), Storage: "sqlite"}
+	blob := models.Blob{Did: urepo.Repo.Did, Cid: c.Bytes(), RefCount: int(refs), CreatedAt: s.repoman.clock.Next().String(), Storage: "sqlite"}
 	s3Upload := s.s3Config != nil && s.s3Config.BlobstoreEnabled
 	commitPossible := false
 	if s3Upload {

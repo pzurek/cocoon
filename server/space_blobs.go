@@ -76,9 +76,28 @@ func (st *spaceStore) recordBlobs(recordURI string) ([]string, error) {
 
 // gcBlobs deletes blobs no record, public or space, references any more.
 func (st *spaceStore) gcBlobs(cids []string) error {
+	if len(cids) == 0 {
+		return nil
+	}
+	var index models.PublicBlobIndex
+	if err := st.db.Where("did = ?", st.did).Find(&index).Error; err != nil {
+		return err
+	}
+	if !index.Complete {
+		// Legacy ref_count values are not authoritative until public records
+		// have been indexed. Retain bytes rather than infer absence.
+		return nil
+	}
 	for _, cs := range cids {
 		c, err := cid.Decode(cs)
 		if err != nil {
+			continue
+		}
+		var inPublic int64
+		if err := st.db.Model(&models.PublicBlobRef{}).Where("did = ? AND blob_cid = ?", st.did, cs).Count(&inPublic).Error; err != nil {
+			return err
+		}
+		if inPublic > 0 {
 			continue
 		}
 		var inSpaces int64

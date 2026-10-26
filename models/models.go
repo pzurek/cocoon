@@ -176,6 +176,25 @@ type Record struct {
 	Value     []byte
 }
 
+// PublicBlobRef is one public record's reference, independent of whether the
+// blob payload exists. Keeping record identity allows revision metadata to be
+// added later without changing the identity or deduplication of a reference.
+type PublicBlobRef struct {
+	Did     string `gorm:"primaryKey;index:idx_public_blob_did_cid,priority:1"`
+	Nsid    string `gorm:"primaryKey"`
+	Rkey    string `gorm:"primaryKey"`
+	BlobCid string `gorm:"primaryKey;index:idx_public_blob_did_cid,priority:2"`
+}
+
+// PublicBlobIndex tracks the durable keyset cursor of the legacy backfill.
+// Only Complete authorizes treating a missing reference as absent.
+type PublicBlobIndex struct {
+	Did      string `gorm:"primaryKey"`
+	Nsid     string
+	Rkey     string
+	Complete bool
+}
+
 type Block struct {
 	Did   string `gorm:"primaryKey;index:idx_blocks_by_rev"`
 	Cid   []byte `gorm:"primaryKey"`

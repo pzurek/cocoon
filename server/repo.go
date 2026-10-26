@@ -860,6 +860,98 @@ func countBlobRefs(records []models.Record) (map[cid.Cid]int, error) {
 	return refs, nil
 }
 
+// Each request advances at most this many legacy records. The cursor and rows
+// commit together; cancellation or a malformed record cannot mark a partial
+// index complete. Readers return a retryable response until it is complete.
+// This bounds record count, not bytes: the batch plus one lookahead record is
+// loaded in memory, and legacy records can vary substantially in size.
+const publicBlobBackfillBatch = 2048
+
+// Caller holds the repository write lock and supplies a write transaction.
+func advancePublicBlobIndex(ctx context.Context, tx *db.DB, did string) (bool, error) {
+	var state models.PublicBlobIndex
+	result := tx.Client().WithContext(ctx).Where("did = ?", did).Find(&state)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	if state.Complete {
+		return true, nil
+	}
+	if result.RowsAffected == 0 {
+		// A missing marker is not proof of completeness, even if rows exist.
+		if err := tx.Exec(ctx, "DELETE FROM public_blob_refs WHERE did = ?", nil, did).Error; err != nil {
+			return false, err
+		}
+		state.Did = did
+	}
+	var records []models.Record
+	if err := tx.Client().WithContext(ctx).Where("did = ? AND (nsid, rkey) > (?, ?)", did, state.Nsid, state.Rkey).
+		Order("nsid, rkey").Limit(publicBlobBackfillBatch + 1).Find(&records).Error; err != nil {
+		return false, err
+	}
+	state.Complete = len(records) <= publicBlobBackfillBatch
+	if !state.Complete {
+		records = records[:publicBlobBackfillBatch]
+	}
+	for _, record := range records {
+		if _, err := replacePublicBlobRefs(ctx, tx, record); err != nil {
+			return false, err
+		}
+		state.Nsid, state.Rkey = record.Nsid, record.Rkey
+	}
+	if err := tx.Save(ctx, &state, nil).Error; err != nil {
+		return false, err
+	}
+	return state.Complete, nil
+}
+
+// preparePublicBlobIndex must run under lockRepoWrite, like import and writes.
+func (s *Server) preparePublicBlobIndex(ctx context.Context, did string) (bool, error) {
+	var state models.PublicBlobIndex
+	if err := s.db.Client().WithContext(ctx).Where("did = ?", did).Find(&state).Error; err != nil {
+		return false, err
+	}
+	if state.Complete {
+		return true, nil
+	}
+	var complete bool
+	err := s.db.Transaction(ctx, func(tx *db.DB) error {
+		if tx.Client().Dialector.Name() == "sqlite" {
+			if err := tx.Exec(ctx, "UPDATE records SET rkey = rkey WHERE 1 = 0", nil).Error; err != nil {
+				return err
+			}
+		}
+		var err error
+		complete, err = advancePublicBlobIndex(ctx, tx, did)
+		return err
+	})
+	return complete, err
+}
+
+func replacePublicBlobRefs(ctx context.Context, tx *db.DB, record models.Record) ([]cid.Cid, error) {
+	var cids []cid.Cid
+	if record.Cid != "" {
+		var err error
+		cids, err = getBlobCidsFromCbor(record.Value)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Exec(ctx, "DELETE FROM public_blob_refs WHERE did = ? AND nsid = ? AND rkey = ?", nil, record.Did, record.Nsid, record.Rkey).Error; err != nil {
+		return nil, err
+	}
+	refs := make([]models.PublicBlobRef, 0, len(cids))
+	for _, c := range cids {
+		refs = append(refs, models.PublicBlobRef{Did: record.Did, Nsid: record.Nsid, Rkey: record.Rkey, BlobCid: c.String()})
+	}
+	if len(refs) > 0 {
+		if err := tx.Client().WithContext(ctx).CreateInBatches(&refs, 100).Error; err != nil {
+			return nil, err
+		}
+	}
+	return cids, nil
+}
+
 func indexRecords(ctx context.Context, database *db.DB, did string, entries []models.Record) ([]lexutil.LexLink, error) {
 	var blobs []lexutil.LexLink
 	err := database.Transaction(ctx, func(tx *db.DB) error {
@@ -869,8 +961,15 @@ func indexRecords(ctx context.Context, database *db.DB, did string, entries []mo
 				return err
 			}
 		}
+		complete, err := advancePublicBlobIndex(ctx, tx, did)
+		if err != nil {
+			return err
+		}
 		deltas := make(map[cid.Cid]int)
 		for _, entry := range entries {
+			if entry.Did != did {
+				return fmt.Errorf("record DID does not match repository")
+			}
 			var old models.Record
 			if err := tx.Raw(ctx, "SELECT value FROM records WHERE did = ? AND nsid = ? AND rkey = ?", nil, did, entry.Nsid, entry.Rkey).Scan(&old).Error; err != nil {
 				return err
@@ -881,6 +980,10 @@ func indexRecords(ctx context.Context, database *db.DB, did string, entries []mo
 			}
 			for _, c := range previous {
 				deltas[c]--
+			}
+			current, err := replacePublicBlobRefs(ctx, tx, entry)
+			if err != nil {
+				return err
 			}
 			if entry.Cid == "" {
 				if err := tx.Delete(ctx, &entry, nil).Error; err != nil {
@@ -896,42 +999,29 @@ func indexRecords(ctx context.Context, database *db.DB, did string, entries []mo
 			}}).Error; err != nil {
 				return err
 			}
-			current, err := getBlobCidsFromCbor(entry.Value)
-			if err != nil {
-				return err
-			}
 			for _, c := range current {
 				deltas[c]++
 				blobs = append(blobs, lexutil.LexLink(c))
 			}
 		}
 		// Apply the batch's net change before removing any unused payloads.
-		var verifiedRefs map[cid.Cid]int
 		for c, delta := range deltas {
-			if err := tx.Exec(ctx, "UPDATE blobs SET ref_count = ref_count + ? WHERE did = ? AND cid = ?", nil, delta, did, c.Bytes()).Error; err != nil {
-				return err
-			}
-			var unused int64
-			if err := tx.Raw(ctx, "SELECT COUNT(*) FROM blobs WHERE did = ? AND cid = ? AND ref_count <= 0", nil, did, c.Bytes()).Scan(&unused).Error; err != nil {
-				return err
-			}
-			if unused == 0 {
+			if !complete {
+				// Legacy counts can be wrong. Never GC from a partial index.
+				if err := tx.Exec(ctx, "UPDATE blobs SET ref_count = ref_count + ? WHERE did = ? AND cid = ?", nil, delta, did, c.Bytes()).Error; err != nil {
+					return err
+				}
 				continue
 			}
-			// Older versions left inaccurate counts; verify before deleting data.
-			if verifiedRefs == nil {
-				var records []models.Record
-				if err := tx.Client().WithContext(ctx).Select("value").Where("did = ?", did).Find(&records).Error; err != nil {
-					return err
-				}
-				var err error
-				verifiedRefs, err = countBlobRefs(records)
-				if err != nil {
-					return err
-				}
-			}
-			if err := tx.Exec(ctx, "UPDATE blobs SET ref_count = ? WHERE did = ? AND cid = ?", nil, verifiedRefs[c], did, c.Bytes()).Error; err != nil {
+			var count int64
+			if err := tx.Raw(ctx, "SELECT COUNT(*) FROM public_blob_refs WHERE did = ? AND blob_cid = ?", nil, did, c.String()).Scan(&count).Error; err != nil {
 				return err
+			}
+			if err := tx.Exec(ctx, "UPDATE blobs SET ref_count = ? WHERE did = ? AND cid = ?", nil, count, did, c.Bytes()).Error; err != nil {
+				return err
+			}
+			if count > 0 {
+				continue
 			}
 			// A blob a space record still names keeps its bytes.
 			var inSpaces int64

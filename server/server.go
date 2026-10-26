@@ -743,6 +743,8 @@ func (s *Server) Migrate() error {
 		&models.RefreshToken{},
 		&models.Block{},
 		&models.Record{},
+		&models.PublicBlobRef{},
+		&models.PublicBlobIndex{},
 		&models.Blob{},
 		&models.BlobPart{},
 		&models.ReservedKey{},

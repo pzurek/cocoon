@@ -202,6 +202,20 @@ func TestImportBlobRefsRollbackAndReplacement(t *testing.T) {
 			uploadTestBlob(t, s, account, "new")
 			mustApply(t, s, account.Did, Op{Type: OpTypeCreate, Collection: "app.bsky.feed.post", Rkey: strPtr("old"), Record: &old})
 			before := importState(t, s, account.Did)
+			assertPublicIndex := func(want []models.PublicBlobRef) {
+				t.Helper()
+				var got []models.PublicBlobRef
+				if err := s.db.Client().Where("did = ?", account.Did).Find(&got).Error; err != nil {
+					t.Fatal(err)
+				}
+				if len(got) != len(want) || (len(want) > 0 && !reflect.DeepEqual(got, want)) {
+					t.Fatalf("public reference index = %+v, want %+v", got, want)
+				}
+				var state models.PublicBlobIndex
+				if err := s.db.Client().Where("did = ?", account.Did).First(&state).Error; err != nil || !state.Complete {
+					t.Fatalf("index completeness = %+v, %v", state, err)
+				}
+			}
 			if fail != "none" {
 				if err := s.db.Exec(context.Background(), "CREATE TRIGGER fail_blob_import BEFORE UPDATE ON "+fail+" BEGIN SELECT RAISE(ABORT, 'test failure'); END", nil).Error; err != nil {
 					t.Fatal(err)
@@ -213,17 +227,20 @@ func TestImportBlobRefsRollbackAndReplacement(t *testing.T) {
 				if status != 500 || !reflect.DeepEqual(before, importState(t, s, account.Did)) {
 					t.Fatalf("failed import changed state: %d %s", status, msg)
 				}
+				assertPublicIndex([]models.PublicBlobRef{{Did: account.Did, Nsid: "app.bsky.feed.post", Rkey: "old", BlobCid: oldCID.String()}})
 			} else {
 				if status != 200 {
 					t.Fatalf("import: %d %s", status, msg)
 				}
 				assertBlobRefs(t, s, account.Did, oldCID, 0)
 				assertBlobRefs(t, s, account.Did, newCID, 1)
+				assertPublicIndex([]models.PublicBlobRef{{Did: account.Did, Nsid: "app.bsky.feed.post", Rkey: "new", BlobCid: newCID.String()}})
 				root, all, _ = importFixture(t, account.Did, nil)
 				if status, _ := callImportRepo(t, s, account, bytes.NewReader(importCAR(t, []cid.Cid{root}, all))); status != 200 {
 					t.Fatalf("empty import: %d", status)
 				}
 				assertBlobRefs(t, s, account.Did, newCID, 0)
+				assertPublicIndex(nil)
 			}
 		})
 	}
