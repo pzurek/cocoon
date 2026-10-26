@@ -356,6 +356,8 @@ func TestBackupCancellationInterruptsVacuumWait(t *testing.T) {
 
 func TestBackupRoutineCancellationJoinsS3Upload(t *testing.T) {
 	t.Chdir(t.TempDir()) // isolate last-backup.txt
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
 	s := newTestServer(t)
 	entered, cancelled := make(chan struct{}), make(chan struct{})
 	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -393,6 +395,9 @@ func TestBackupRoutineCancellationJoinsS3Upload(t *testing.T) {
 	}
 	if _, err := os.Stat("last-backup.txt"); !os.IsNotExist(err) {
 		t.Fatalf("cancelled backup wrote success marker: %v", err)
+	}
+	if paths, err := filepath.Glob(filepath.Join(tmp, ".cocoon-backup-*.tmp")); err != nil || len(paths) != 0 {
+		t.Fatalf("cancelled backup left temporary snapshots: %v %v", paths, err)
 	}
 }
 

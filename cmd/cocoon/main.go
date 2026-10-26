@@ -110,6 +110,11 @@ func main() {
 				Value:   server.DefaultBlobUploadLimit,
 			},
 			&cli.StringFlag{
+				Name:    "backup-dir",
+				Usage:   "Directory for hourly SQLite snapshots (empty disables local backups)",
+				EnvVars: []string{"COCOON_BACKUP_DIR"},
+			},
+			&cli.StringFlag{
 				Name:    "smtp-user",
 				EnvVars: []string{"COCOON_SMTP_USER"},
 			},
@@ -275,6 +280,7 @@ var runServe = &cli.Command{
 			DisableSpaces:      !cmd.Bool("spaces-enabled"),
 			KEMBackfillEnabled: cmd.Bool("kem-backfill-enabled"),
 			BlobUploadLimit:    cmd.Int64("blob-upload-limit"),
+			BackupDir:          cmd.String("backup-dir"),
 			SmtpUser:           cmd.String("smtp-user"),
 			SmtpPass:           cmd.String("smtp-pass"),
 			SmtpHost:           cmd.String("smtp-host"),

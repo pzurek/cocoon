@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"embed"
@@ -20,8 +19,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/syntax"
@@ -156,6 +153,7 @@ type Args struct {
 	DisableSpaces      bool
 	KEMBackfillEnabled bool
 	BlobUploadLimit    int64
+	BackupDir          string
 
 	SmtpUser  string
 	SmtpPass  string
@@ -197,6 +195,7 @@ type config struct {
 	DisableSpaces      bool
 	KEMBackfillEnabled bool
 	BlobUploadLimit    int64
+	BackupDir          string
 	SmtpEmail          string
 	SmtpName           string
 	SessionCookieKey   string
@@ -549,6 +548,7 @@ func New(args *Args) (*Server, error) {
 			DisableSpaces:      args.DisableSpaces,
 			KEMBackfillEnabled: args.KEMBackfillEnabled,
 			BlobUploadLimit:    args.BlobUploadLimit,
+			BackupDir:          args.BackupDir,
 			SmtpName:           args.SmtpName,
 			SmtpEmail:          args.SmtpEmail,
 			SessionCookieKey:   args.SessionCookieKey,
@@ -942,88 +942,99 @@ func (s *Server) doBackup(ctx context.Context) {
 
 	start := time.Now()
 
-	logger.Info("beginning backup to s3...")
-
-	tmpFile := fmt.Sprintf("/tmp/cocoon-backup-%s.db", time.Now().Format(time.RFC3339Nano))
+	logger.Info("beginning database backup")
+	dir := s.config.BackupDir
+	// Create an unpredictable, owner-only empty file; VACUUM INTO accepts it.
+	// The operator provisions the directory; creating it here without syncing
+	// every new ancestor would not make the first backup crash-durable.
+	// Local snapshots use the destination filesystem for atomic publication.
+	tmp, err := os.CreateTemp(dir, ".cocoon-backup-*.tmp")
+	if err != nil {
+		logger.Error("error creating backup file", "err", err)
+		return
+	}
+	tmpFile := tmp.Name()
 	defer os.Remove(tmpFile)
+	if err := tmp.Close(); err != nil {
+		logger.Error("error closing empty backup file", "err", err)
+		return
+	}
 
 	if err := s.db.Client().WithContext(ctx).Exec("VACUUM INTO ?", tmpFile).Error; err != nil {
 		logger.Error("error creating tmp backup file", "err", err)
 		return
 	}
 
-	backupData, err := os.ReadFile(tmpFile)
+	file, err := os.OpenFile(tmpFile, os.O_RDWR, 0600)
 	if err != nil {
-		logger.Error("error reading tmp backup file", "err", err)
+		logger.Error("error opening backup file", "err", err)
 		return
 	}
-
-	logger.Info("sending to s3...")
-
-	currTime := time.Now().Format("2006-01-02_15-04-05")
+	defer file.Close()
+	if err := file.Sync(); err != nil {
+		logger.Error("error syncing backup file", "err", err)
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	currTime := time.Now().UTC().Format("2006-01-02_15-04-05.000000000")
 	key := "cocoon-backup-" + currTime + ".db"
-
-	config := &aws.Config{
-		Region:      aws.String(s.s3Config.Region),
-		Credentials: credentials.NewStaticCredentials(s.s3Config.AccessKey, s.s3Config.SecretKey, ""),
+	if dir != "" {
+		if err := os.Rename(tmpFile, filepath.Join(dir, key)); err != nil {
+			logger.Error("error publishing local backup", "err", err)
+			return
+		}
+		parent, err := os.Open(dir)
+		if err != nil {
+			logger.Error("error opening backup directory", "err", err)
+			return
+		}
+		err = parent.Sync()
+		_ = parent.Close()
+		if err != nil {
+			logger.Error("error syncing backup directory", "err", err)
+			return
+		}
 	}
-
-	if s.s3Config.Endpoint != "" {
-		config.Endpoint = aws.String(s.s3Config.Endpoint)
-		config.S3ForcePathStyle = aws.Bool(true)
+	if s.s3Config != nil && s.s3Config.BackupsEnabled {
+		svc, err := s.s3Client()
+		if err != nil {
+			logger.Error("error creating s3 session", "err", err)
+			return
+		}
+		// *os.File is rewindable for SDK retries, without buffering the snapshot.
+		if _, err := svc.PutObjectWithContext(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(s.s3Config.Bucket), Key: aws.String(key), Body: file,
+		}); err != nil {
+			logger.Error("error uploading backup to s3; any local snapshot is retained", "err", err)
+			return
+		}
 	}
-
-	sess, err := session.NewSession(config)
-	if err != nil {
-		logger.Error("error creating s3 session", "err", err)
-		return
+	logger.Info("finished database backup", "key", key, "duration", time.Since(start).Seconds())
+	if err := os.WriteFile(filepath.Join(dir, "last-backup.txt"), []byte(time.Now().UTC().Format(time.RFC3339Nano)), 0600); err != nil {
+		logger.Error("error recording backup completion", "err", err)
 	}
-
-	svc := s3.New(sess)
-
-	if _, err := svc.PutObjectWithContext(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(s.s3Config.Bucket),
-		Key:    aws.String(key),
-		Body:   bytes.NewReader(backupData),
-	}); err != nil {
-		logger.Error("error uploading file to s3", "err", err)
-		return
-	}
-
-	logger.Info("finished uploading backup to s3", "key", key, "duration", time.Since(start).Seconds())
-
-	os.WriteFile("last-backup.txt", []byte(time.Now().Format(time.RFC3339Nano)), 0644)
 }
 
 func (s *Server) backupRoutine(ctx context.Context) {
 	logger := s.logger.With("name", "backupRoutine")
 
-	if s.s3Config == nil || !s.s3Config.BackupsEnabled {
+	s3Enabled := s.s3Config != nil && s.s3Config.BackupsEnabled
+	if s.config.BackupDir == "" && !s3Enabled {
 		return
 	}
-
-	if s.s3Config.Region == "" {
-		logger.Warn("no s3 region configured but backups are enabled. backups will not run.")
+	if s.dbType == "postgres" {
+		logger.Warn("built-in snapshots are SQLite-only; configure external PostgreSQL backups")
 		return
 	}
-
-	if s.s3Config.Bucket == "" {
-		logger.Warn("no s3 bucket configured but backups are enabled. backups will not run.")
-		return
-	}
-
-	if s.s3Config.AccessKey == "" {
-		logger.Warn("no s3 access key configured but backups are enabled. backups will not run.")
-		return
-	}
-
-	if s.s3Config.SecretKey == "" {
-		logger.Warn("no s3 secret key configured but backups are enabled. backups will not run.")
+	if s3Enabled && (s.s3Config.Region == "" || s.s3Config.Bucket == "" || s.s3Config.AccessKey == "" || s.s3Config.SecretKey == "") {
+		logger.Warn("incomplete S3 backup configuration; backups will not run")
 		return
 	}
 
 	shouldBackupNow := false
-	lastBackupStr, err := os.ReadFile("last-backup.txt")
+	lastBackupStr, err := os.ReadFile(filepath.Join(s.config.BackupDir, "last-backup.txt"))
 	if err != nil {
 		shouldBackupNow = true
 	} else {

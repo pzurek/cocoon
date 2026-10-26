@@ -126,6 +126,46 @@ COCOON_DB_NAME="/data/cocoon/cocoon.db"
 
 > **Note**: When using PostgreSQL, database backups to S3 are not handled by Cocoon. Use `pg_dump` or your database provider's backup solution instead.
 
+#### Backups and Restore Rehearsal
+
+Set `COCOON_BACKUP_DIR=/private/backups/cocoon` (or `--backup-dir`) for
+hourly local SQLite snapshots, independently of S3. Provision this directory
+beforehand with owner-only access (mode 0700); Cocoon does not create it or change
+existing directory permissions. With neither a local
+directory nor S3 backups enabled, there is **no built-in backup schedule**.
+Snapshots use `VACUUM INTO`, are synced and atomically published with mode
+0600, and include database-held account signing keys and SQLite blob payloads.
+S3 backups stream the snapshot from disk; they do not buffer the whole database.
+One process performs backups serially. A failed S3 upload retains a completed
+local snapshot when local backups are enabled, without recording full success.
+
+Backups run on startup if the last successful backup is missing or more than
+an hour old, then hourly. Inspect logs and `last-backup.txt` in the local backup
+directory (working directory for S3-only backups). An incomplete S3 backup
+configuration disables the schedule even if a local directory is configured.
+Monitor free disk space and copy snapshots off-host with encryption and access
+controls. Automatic pruning is deliberately absent: define retention only after
+verifying a restore, and never expose snapshots through a public bucket/CDN.
+
+A database snapshot is **not a complete recovery bundle**. Securely preserve
+the PDS rotation-key file, JWK file, session secret, configuration, DPoP nonce
+secret, and independently held recovery keys. Back up S3 blob objects separately,
+including historical key layouts; the database contains only their metadata.
+Keep the exact binary/image version and its configuration with the recovery plan.
+
+Rehearse with disposable identities first. Copy a snapshot into a fresh isolated
+directory, open it with SQLite and require `PRAGMA integrity_check` to return
+`ok`; verify account keys, repository heads/blocks and representative blobs.
+Restore external keys/configuration and S3 payloads into isolated destinations.
+Block outbound network access before starting restored data, disable Spaces and
+KEM backfill, and test sign-in, repository export and blob reads locally. Those
+flags alone do not isolate a restored PDS. Do not run two copies of a real
+identity, publish PLC changes, or switch traffic as part of a rehearsal.
+For an actual restore, stop the PDS first and preserve its old database **and
+WAL/SHM files together** before selecting the verified snapshot; never mix old
+WAL files with a restored database. Production restore/cutover requires a separate
+operator decision.
+
 #### SMTP Email Settings
 ```bash
 COCOON_SMTP_USER="your-smtp-username"
