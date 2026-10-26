@@ -309,6 +309,15 @@ to the XRPC proxy. Existing Spaces data is retained and migrations still run, so
 re-enabling does not discard memberships, records or pending notifications. This
 switch does not control automatic PLC KEM-key backfill or account key creation.
 
+Automatic KEM-key backfill is **off by default**. To upgrade existing accounts,
+explicitly set `COCOON_KEM_BACKFILL_ENABLED=true` (or `--kem-backfill-enabled`
+before `run`). It can publish signed PLC operations and firehose identity events
+for accounts whose PLC rotation key and current PDS match this server. Review the
+candidate release, account inventory, PLC destination and backed-up recovery keys
+before opting in; rehearse with disposable identities first. A copied database
+with real keys and network access is not an isolated test. New-account key
+creation and user-requested identity operations are unaffected by this setting.
+
 - [x] `com.atproto.space.createRecord`, `putRecord`, `deleteRecord`, `applyWrites`
 - [x] `com.atproto.space.getRecord`, `listRecords`, `listRepoOps`, `getLatestCommit`, `getRepo`, `listSpaces`
 - [x] `com.atproto.space.getBlob`, `listBlobs`

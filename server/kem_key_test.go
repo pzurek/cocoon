@@ -135,6 +135,37 @@ func TestSubmitPlcOpChecksKemKey(t *testing.T) {
 	}
 }
 
+func TestKemKeyBackfillRequiresOptIn(t *testing.T) {
+	s := newTestServer(t)
+	acct := s.createTestAccount(t, "no-backfill.pds.test")
+	p := newPlcTestServer(t)
+	plcClient := s.attachPlcClient(t, p)
+	rotationKey, err := plcClient.RotationKeyDID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.log = identity.DidAuditLog{{
+		Did: acct.Did, Cid: "bafyprev",
+		Operation: identity.DidLogEntry{
+			RotationKeys:        []string{rotationKey},
+			VerificationMethods: map[string]string{"atproto": "did:key:zQ3shtCGgFrAtUwdiHRYzKQqNUNiLNGoXjSaMfZxNhbRvbbRS"},
+			Services:            map[string]identity.OperationService{"atproto_pds": {Type: "AtprotoPersonalDataServer", Endpoint: plcClient.PdsEndpoint()}},
+		},
+	}}
+	if err := s.db.Exec(t.Context(), "UPDATE repos SET kem_key = NULL WHERE did = ?", nil, acct.Did).Error; err != nil {
+		t.Fatal(err)
+	}
+	s.kemKeyBackfillRoutine(t.Context())
+	if kemDidKeyOf(t, s, acct.Did) != "" || len(p.ops) != 0 {
+		t.Fatal("automatic backfill changed an account without operator opt-in")
+	}
+	s.config.KEMBackfillEnabled = true
+	s.kemKeyBackfillRoutine(t.Context())
+	if key := kemDidKeyOf(t, s, acct.Did); key == "" || len(p.ops) != 1 || p.ops[0].VerificationMethods["atproto_kem"] != key {
+		t.Fatal("opted-in backfill did not publish and store the matching key")
+	}
+}
+
 func TestKemKeyBackfill(t *testing.T) {
 	t.Parallel()
 	s := newTestServer(t)

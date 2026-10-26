@@ -130,21 +130,22 @@ type Server struct {
 type Args struct {
 	Logger *slog.Logger
 
-	LogLevel        slog.Level
-	Addr            string
-	DbName          string
-	DbType          string
-	DatabaseURL     string
-	Version         string
-	Did             string
-	Hostname        string
-	RotationKeyPath string
-	JwkPath         string
-	ContactEmail    string
-	Relays          []string
-	AdminPassword   string
-	RequireInvite   bool
-	DisableSpaces   bool
+	LogLevel           slog.Level
+	Addr               string
+	DbName             string
+	DbType             string
+	DatabaseURL        string
+	Version            string
+	Did                string
+	Hostname           string
+	RotationKeyPath    string
+	JwkPath            string
+	ContactEmail       string
+	Relays             []string
+	AdminPassword      string
+	RequireInvite      bool
+	DisableSpaces      bool
+	KEMBackfillEnabled bool
 
 	SmtpUser  string
 	SmtpPass  string
@@ -174,21 +175,22 @@ type Args struct {
 }
 
 type config struct {
-	LogLevel          slog.Level
-	Version           string
-	Did               string
-	Hostname          string
-	ContactEmail      string
-	EnforcePeering    bool
-	Relays            []string
-	AdminPassword     string
-	RequireInvite     bool
-	DisableSpaces     bool
-	SmtpEmail         string
-	SmtpName          string
-	SessionCookieKey  string
-	BlockstoreVariant BlockstoreVariant
-	FallbackProxy     string
+	LogLevel           slog.Level
+	Version            string
+	Did                string
+	Hostname           string
+	ContactEmail       string
+	EnforcePeering     bool
+	Relays             []string
+	AdminPassword      string
+	RequireInvite      bool
+	DisableSpaces      bool
+	KEMBackfillEnabled bool
+	SmtpEmail          string
+	SmtpName           string
+	SessionCookieKey   string
+	BlockstoreVariant  BlockstoreVariant
+	FallbackProxy      string
 }
 
 type CustomValidator struct {
@@ -499,21 +501,22 @@ func New(args *Args) (*Server, error) {
 		publicJwk:  publicJwk,
 		publicKid:  publicKid,
 		config: &config{
-			LogLevel:          args.LogLevel,
-			Version:           args.Version,
-			Did:               args.Did,
-			Hostname:          args.Hostname,
-			ContactEmail:      args.ContactEmail,
-			EnforcePeering:    false,
-			Relays:            args.Relays,
-			AdminPassword:     args.AdminPassword,
-			RequireInvite:     args.RequireInvite,
-			DisableSpaces:     args.DisableSpaces,
-			SmtpName:          args.SmtpName,
-			SmtpEmail:         args.SmtpEmail,
-			SessionCookieKey:  args.SessionCookieKey,
-			BlockstoreVariant: args.BlockstoreVariant,
-			FallbackProxy:     args.FallbackProxy,
+			LogLevel:           args.LogLevel,
+			Version:            args.Version,
+			Did:                args.Did,
+			Hostname:           args.Hostname,
+			ContactEmail:       args.ContactEmail,
+			EnforcePeering:     false,
+			Relays:             args.Relays,
+			AdminPassword:      args.AdminPassword,
+			RequireInvite:      args.RequireInvite,
+			DisableSpaces:      args.DisableSpaces,
+			KEMBackfillEnabled: args.KEMBackfillEnabled,
+			SmtpName:           args.SmtpName,
+			SmtpEmail:          args.SmtpEmail,
+			SessionCookieKey:   args.SessionCookieKey,
+			BlockstoreVariant:  args.BlockstoreVariant,
+			FallbackProxy:      args.FallbackProxy,
 		},
 		evtman:        events.NewEventManager(evtPersister),
 		evtpersister:  evtPersister,

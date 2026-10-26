@@ -32,6 +32,10 @@ import (
 const kemBackfillRetryEvery = time.Minute
 
 func (s *Server) kemKeyBackfillRoutine(ctx context.Context) {
+	if !s.config.KEMBackfillEnabled {
+		s.logger.Info("automatic KEM key backfill disabled")
+		return
+	}
 	for {
 		failed, err := s.backfillKemKeys(ctx)
 		if err == nil && failed == 0 {
