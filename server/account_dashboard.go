@@ -248,7 +248,12 @@ func (s *Server) pruneOauthTokens(ctx context.Context, now time.Time) (int64, er
 	if res.Error != nil {
 		return n, res.Error
 	}
-	return n + res.RowsAffected, nil
+	n += res.RowsAffected
+	// Sessions are physically deleted by several revocation paths. Keep replay
+	// history for every live session, and remove it once its session is gone.
+	res = s.db.Exec(ctx, `DELETE FROM oauth_used_refresh_tokens WHERE NOT EXISTS
+		(SELECT 1 FROM oauth_tokens WHERE id = oauth_used_refresh_tokens.oauth_token_id)`, nil)
+	return n, res.Error
 }
 
 func (s *Server) oauthTokenCleanupRoutine(ctx context.Context) {

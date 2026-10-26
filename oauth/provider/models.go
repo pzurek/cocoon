@@ -70,6 +70,13 @@ type OauthToken struct {
 	Ip             string
 }
 
+// OauthUsedRefreshToken retains replay detection across rotations and restarts.
+// Only a SHA-256 digest is stored; orphaned entries are pruned with OAuth sessions.
+type OauthUsedRefreshToken struct {
+	TokenHash    string `gorm:"primaryKey"`
+	OauthTokenID uint   `gorm:"not null;index"`
+}
+
 type OauthAuthorizationRequest struct {
 	gorm.Model
 	RequestId      string     `gorm:"primaryKey"`
