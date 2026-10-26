@@ -239,61 +239,67 @@ func (s *Server) handleOauthToken(e echo.Context) error {
 		}
 
 		refreshHash := fmt.Sprintf("%x", sha256.Sum256([]byte(*req.RefreshToken)))
-		const revokeReplayedRefresh = `DELETE FROM oauth_tokens WHERE id IN
-			(SELECT oauth_token_id FROM oauth_used_refresh_tokens WHERE token_hash = ?)`
 		var oauthToken provider.OauthToken
-		if err := s.db.Raw(ctx, "SELECT * FROM oauth_tokens WHERE refresh_token = ?", nil, req.RefreshToken).Scan(&oauthToken).Error; err != nil {
+		if err := s.db.Raw(ctx, `SELECT * FROM oauth_tokens WHERE refresh_token = ? OR id IN
+			(SELECT oauth_token_id FROM oauth_used_refresh_tokens WHERE token_hash = ?)`,
+			nil, *req.RefreshToken, refreshHash).Scan(&oauthToken).Error; err != nil {
 			logger.Error("error finding oauth token by refresh token", "error", err)
-			return helpers.ServerError(e, nil)
+			// The reference treats failure to consume a refresh token as invalid_grant.
+			return helpers.InvalidGrantError(e, "Invalid refresh token")
 		}
-		// Scan leaves oauthToken zero-valued when no row matches: the refresh
-		// token was never issued, or has already been rotated or revoked.
-		if oauthToken.RefreshToken == "" {
-			if err := s.db.Exec(ctx, revokeReplayedRefresh, nil, refreshHash).Error; err != nil {
-				logger.Error("error revoking replayed refresh token", "error", err)
+		if oauthToken.ID == 0 {
+			return helpers.InvalidGrantError(e, "Invalid refresh token")
+		}
+		// Once the session has been found, every failed refresh revokes it.
+		// A disconnected caller must not cancel this security cleanup.
+		rejectRefresh := func(status int, code, description string) error {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if err := s.db.Exec(cleanupCtx, "DELETE FROM oauth_tokens WHERE id = ?", nil, oauthToken.ID).Error; err != nil {
+				logger.Error("error revoking failed refresh session", "error", err)
 				return helpers.ServerError(e, nil)
 			}
-			return helpers.InvalidGrantError(e, "Invalid refresh token")
+			return e.JSON(status, map[string]string{"error": code, "error_description": description})
+		}
+		if oauthToken.RefreshToken != *req.RefreshToken {
+			return rejectRefresh(400, "invalid_grant", "Refresh token replayed")
 		}
 		repo, err := s.getRepoActorByDid(ctx, oauthToken.Sub)
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return helpers.InvalidGrantError(e, "Account not found")
+				return rejectRefresh(400, "invalid_grant", "Account not found")
 			}
-			// A transient lookup failure must not be reported as invalid_grant:
-			// clients treat that as terminal and discard the session.
 			logger.Error("error finding actor for refresh token", "error", err)
-			return helpers.ServerError(e, nil)
+			return rejectRefresh(500, "server_error", "Unable to load account")
 		}
 		if oauthToken.SessionVersion != repo.SessionVersion {
-			return helpers.InvalidGrantError(e, "Session revoked")
+			return rejectRefresh(400, "invalid_grant", "Session revoked")
 		}
 
 		if client.Metadata.ClientID != oauthToken.ClientId {
-			return helpers.InputError(e, to.StringPtr(`"client_id" mismatch`))
+			return rejectRefresh(400, "invalid_grant", `"client_id" mismatch`)
 		}
 
 		if clientAuth.Method != oauthToken.ClientAuth.Method {
-			return helpers.InputError(e, to.StringPtr(`"client authentication method mismatch`))
+			return rejectRefresh(400, "invalid_grant", "client authentication method mismatch")
 		}
 
 		if !dpopJktMatches(oauthToken.Parameters.DpopJkt, proof) {
-			return helpers.InputError(e, to.StringPtr("dpop proof does not match expected jkt"))
+			return rejectRefresh(400, "invalid_grant", "dpop proof does not match expected jkt")
 		}
 
 		ageRes := oauth.GetSessionAgeFromToken(oauthToken)
 
 		if ageRes.SessionExpired {
-			return helpers.InvalidGrantError(e, "Session expired")
+			return rejectRefresh(400, "invalid_grant", "Session expired")
 		}
 
 		if ageRes.RefreshExpired {
-			return helpers.InvalidGrantError(e, "Refresh token expired")
+			return rejectRefresh(400, "invalid_grant", "Refresh token expired")
 		}
 
 		if client.Metadata.DpopBoundAccessTokens && oauthToken.Parameters.DpopJkt == nil {
-			// why? ref impl
-			return helpers.InputError(e, to.StringPtr("dpop jkt is required for dpop bound access tokens"))
+			return rejectRefresh(400, "invalid_grant", "dpop jkt is required for dpop bound access tokens")
 		}
 
 		nextTokenId := oauth.GenerateTokenId()
@@ -302,7 +308,7 @@ func (s *Server) handleOauthToken(e echo.Context) error {
 		expandedScope, err := s.issueScope(ctx, oauthToken.Parameters.Scope, oauthToken.Sub)
 		if err != nil {
 			s.logger.Error("refusing to refresh token: space type declaration unavailable", "scope", oauthToken.Parameters.Scope, "error", err)
-			return invalidScopeError(e, err)
+			return rejectRefresh(400, "invalid_scope", err.Error())
 		}
 		oauthToken.Parameters.Scope = expandedScope
 
@@ -326,7 +332,8 @@ func (s *Server) handleOauthToken(e echo.Context) error {
 		accessToken.Header["kid"] = s.publicKid
 		accessString, err := accessToken.SignedString(s.privateKey)
 		if err != nil {
-			return err
+			logger.Error("error signing refreshed token", "error", err)
+			return rejectRefresh(500, "server_error", "Unable to sign token")
 		}
 
 		sessionLifetime, refreshLifetime := oauth.GetSessionLifetimes(oauthToken)
@@ -343,9 +350,7 @@ func (s *Server) handleOauthToken(e echo.Context) error {
 				return result.Error
 			}
 			if result.RowsAffected != 1 {
-				// Another request may have rotated since our initial read. Commit
-				// revocation before returning invalid_grant to that replaying caller.
-				return tx.Exec(ctx, revokeReplayedRefresh, nil, refreshHash).Error
+				return nil // The failed refresh will revoke the session below.
 			}
 			// Rotation and replay history must commit together: a failure cannot
 			// publish credentials without retaining their predecessor's identity.
@@ -359,10 +364,10 @@ func (s *Server) handleOauthToken(e echo.Context) error {
 		})
 		if err != nil {
 			logger.Error("error rotating token", "error", err)
-			return helpers.ServerError(e, nil)
+			return rejectRefresh(500, "server_error", "Unable to rotate token")
 		}
 		if !rotated {
-			return helpers.InvalidGrantError(e, "Invalid refresh token")
+			return rejectRefresh(400, "invalid_grant", "Invalid refresh token")
 		}
 
 		// prob not needed

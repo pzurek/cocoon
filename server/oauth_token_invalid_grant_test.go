@@ -114,6 +114,9 @@ func TestOauthTokenRefreshInvalidGrant(t *testing.T) {
 				"refresh_token": {refresh},
 			})
 			assertInvalidGrant(t, w)
+			if countOauthTokens(t, s) != 0 {
+				t.Fatal("invalid refresh left its session usable")
+			}
 		})
 	}
 }
@@ -185,6 +188,13 @@ func TestOauthTokenRefreshRotation(t *testing.T) {
 				if err := s.db.Exec(ctx, "DROP TRIGGER fail_rotation", nil).Error; err != nil {
 					t.Fatal(err)
 				}
+				if countOauthTokens(t, s) != 0 {
+					t.Fatal("failed rotation must revoke the session")
+				}
+				w = httptest.NewRecorder()
+				s.echo.ServeHTTP(w, authorizationCodeRequest(t, s, form))
+				assertInvalidGrant(t, w)
+				return
 			}
 			results := make(chan *httptest.ResponseRecorder, n)
 			for range n {
@@ -389,21 +399,112 @@ func TestOauthRefreshRechecksAfterScopeResolution(t *testing.T) {
 					}
 				} else {
 					assertInvalidGrant(t, w)
-					var rotated int64
-					if err := s.db.Raw(ctx, "SELECT COUNT(*) FROM oauth_tokens WHERE token != ? OR refresh_token != ?", nil, token.Token, token.RefreshToken).Scan(&rotated).Error; err != nil {
-						t.Fatal(err)
-					}
-					wantCount := int64(1)
-					if change == "token deletion" {
-						wantCount = 0
-					}
-					if rotated != 0 || countOauthTokens(t, s) != wantCount {
-						t.Fatal("rejected refresh changed stored credentials")
+					if countOauthTokens(t, s) != 0 {
+						t.Fatal("rejected refresh must revoke its session")
 					}
 				}
 			})
 		}
 	}
+}
+
+func TestOauthRefreshRejectionRevokesSession(t *testing.T) {
+	for _, name := range []string{"wrong client", "wrong auth method", "wrong proof", "missing proof", "scope failure", "cancellation", "invalid proof", "unknown token", "revocation failure"} {
+		t.Run(name, func(t *testing.T) {
+			s, account := endpointTestServer(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			auth, _ := authorizationCodeFixture(t, s, account)
+			token := provider.OauthToken{
+				ClientId: auth.ClientId, ClientAuth: auth.ClientAuth, Parameters: auth.Parameters,
+				Sub: account.Did, Token: "test-access", RefreshToken: "test-refresh", ExpiresAt: time.Now().Add(time.Hour),
+			}
+			switch name {
+			case "wrong client", "revocation failure":
+				token.ClientId = "http://localhost?scope=atproto"
+			case "wrong auth method":
+				token.ClientAuth.Method = "private_key_jwt"
+			case "scope failure":
+				token.Parameters.Scope = "atproto space:com.example.space"
+				s.spaceTypes = declaredSpaceTypes{}
+			case "cancellation":
+				token.Parameters.Scope = "atproto include:com.example.permissions"
+				s.scopeResolver = codeExchangeResolver(func(context.Context) { cancel() })
+			}
+			if err := s.db.Create(ctx, &token, nil).Error; err != nil {
+				t.Fatal(err)
+			}
+			if name == "revocation failure" {
+				if err := s.db.Exec(ctx, "CREATE TRIGGER fail_revoke BEFORE DELETE ON oauth_tokens BEGIN SELECT RAISE(ABORT, 'test failure'); END", nil).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			seedRefreshToken(t, s, account.Did, "unrelated-session")
+			form := url.Values{"client_id": {auth.ClientId}, "grant_type": {"refresh_token"}, "refresh_token": {token.RefreshToken}}
+			if name == "unknown token" {
+				form.Set("refresh_token", "not-issued")
+			}
+			r := authorizationCodeRequest(t, s, form).WithContext(ctx)
+			switch name {
+			case "wrong proof":
+				r.Header.Set("DPoP", newTestDpopProof(t, s, r.Method, r.URL.String(), nil))
+			case "missing proof":
+				r.Header.Del("DPoP")
+			case "invalid proof":
+				r.Header.Set("DPoP", "not-a-proof")
+			}
+			w := httptest.NewRecorder()
+			s.echo.ServeHTTP(w, r)
+			wantStatus, wantCount := 400, int64(1)
+			if name == "cancellation" {
+				wantStatus = 500
+			}
+			if name == "invalid proof" || name == "unknown token" {
+				wantCount = 2 // No session was consumed by these protocol failures.
+			}
+			if name == "revocation failure" {
+				wantStatus, wantCount = 500, 2
+			}
+			if w.Code != wantStatus || countOauthTokens(t, s) != wantCount {
+				t.Fatalf("status=%d sessions=%d, want %d/%d: %s", w.Code, countOauthTokens(t, s), wantStatus, wantCount, w.Body.String())
+			}
+			if name != "invalid proof" && name != "revocation failure" {
+				wantError := "invalid_grant"
+				if name == "scope failure" {
+					wantError = "invalid_scope"
+				} else if name == "cancellation" {
+					wantError = "server_error"
+				}
+				var body map[string]string
+				if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body["error"] != wantError {
+					t.Fatalf("expected %s: %s", wantError, w.Body.String())
+				}
+			}
+			if name == "revocation failure" {
+				if err := s.db.Exec(ctx, "DROP TRIGGER fail_revoke", nil).Error; err != nil {
+					t.Fatal(err)
+				}
+				w = httptest.NewRecorder()
+				s.echo.ServeHTTP(w, authorizationCodeRequest(t, s, form))
+				assertInvalidGrant(t, w)
+				if countOauthTokens(t, s) != 1 {
+					t.Fatal("retry did not revoke the rejected session")
+				}
+			}
+			if err := s.db.First(t.Context(), &provider.OauthToken{}, "refresh_token = ?", "unrelated-session").Error; err != nil {
+				t.Fatalf("rejection revoked unrelated session: %v", err)
+			}
+		})
+	}
+}
+
+func TestOauthRefreshLookupFailure(t *testing.T) {
+	s, _ := endpointTestServer(t)
+	if err := s.db.Exec(t.Context(), "DROP TABLE oauth_tokens", nil).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := postOauthToken(t, s, url.Values{"client_id": {"http://localhost"}, "grant_type": {"refresh_token"}, "refresh_token": {"unreadable"}})
+	assertInvalidGrant(t, w)
 }
 
 func TestOauthTokenAuthorizationCodeInvalidGrant(t *testing.T) {
