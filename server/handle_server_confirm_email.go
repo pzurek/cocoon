@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"time"
 
 	"github.com/Azure/go-autorest/autorest/to"
@@ -30,6 +31,10 @@ func (s *Server) handleServerConfirmEmail(e echo.Context) error {
 		return helpers.InputError(e, nil)
 	}
 
+	if strings.ToLower(req.Email) != strings.ToLower(urepo.Email) {
+		return helpers.InputError(e, to.StringPtr("InvalidEmail"))
+	}
+
 	if urepo.EmailVerificationCode == nil || urepo.EmailVerificationCodeExpiresAt == nil {
 		return helpers.ExpiredTokenError(e)
 	}
@@ -38,15 +43,27 @@ func (s *Server) handleServerConfirmEmail(e echo.Context) error {
 		return helpers.InputError(e, to.StringPtr("InvalidToken"))
 	}
 
-	if time.Now().UTC().After(*urepo.EmailVerificationCodeExpiresAt) {
+	now := time.Now().UTC()
+	if !now.Before(*urepo.EmailVerificationCodeExpiresAt) {
 		return helpers.ExpiredTokenError(e)
 	}
 
-	now := time.Now().UTC()
-
-	if err := s.db.Exec(ctx, "UPDATE repos SET email_verification_code = NULL, email_verification_code_expires_at = NULL, email_confirmed_at = ? WHERE did = ?", nil, now, urepo.Repo.Did).Error; err != nil {
-		logger.Error("error updating user", "error", err)
+	// Bind proof consumption to the exact stored mailbox and challenge, not
+	// merely the middleware snapshot. Concurrent uses can have only one winner.
+	result := s.db.Client().WithContext(ctx).Model(&models.Repo{}).
+		Where("did = ? AND email = ? AND email_verification_code = ? AND email_verification_code_expires_at = ? AND email_verification_code_expires_at > ?",
+			urepo.Repo.Did, urepo.Email, req.Token, urepo.EmailVerificationCodeExpiresAt, now).
+		Updates(map[string]any{
+			"email_verification_code":            nil,
+			"email_verification_code_expires_at": nil,
+			"email_confirmed_at":                 now,
+		})
+	if result.Error != nil {
+		logger.Error("error updating user", "error", result.Error)
 		return helpers.ServerError(e, nil)
+	}
+	if result.RowsAffected != 1 {
+		return helpers.InvalidTokenError(e)
 	}
 
 	return e.NoContent(200)

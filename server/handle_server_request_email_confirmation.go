@@ -23,9 +23,24 @@ func (s *Server) handleServerRequestEmailConfirmation(e echo.Context) error {
 	code := fmt.Sprintf("%s-%s", helpers.RandomVarchar(5), helpers.RandomVarchar(5))
 	eat := time.Now().Add(10 * time.Minute).UTC()
 
-	if err := s.db.Exec(ctx, "UPDATE repos SET email_verification_code = ?, email_verification_code_expires_at = ? WHERE did = ?", nil, code, eat, urepo.Repo.Did).Error; err != nil {
-		logger.Error("error updating user", "error", err)
+	// A stale request must not recreate a challenge cleared by updateEmail,
+	// including a same-address reset. Do not hold a transaction while mailing.
+	result := s.db.Client().WithContext(ctx).Model(&models.Repo{}).Where(map[string]any{
+		"did":                                urepo.Repo.Did,
+		"email":                              urepo.Email,
+		"email_confirmed_at":                 nil,
+		"email_verification_code":            urepo.EmailVerificationCode,
+		"email_verification_code_expires_at": urepo.EmailVerificationCodeExpiresAt,
+	}).Updates(map[string]any{
+		"email_verification_code":            code,
+		"email_verification_code_expires_at": eat,
+	})
+	if result.Error != nil {
+		logger.Error("error updating user", "error", result.Error)
 		return helpers.ServerError(e, nil)
+	}
+	if result.RowsAffected != 1 {
+		return helpers.InputError(e, to.StringPtr("InvalidRequest"))
 	}
 
 	if err := s.sendEmailVerification(urepo.Email, urepo.Handle, code); err != nil {
