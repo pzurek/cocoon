@@ -91,7 +91,7 @@ func (s *Server) retrySpaceDeletedOne(ctx context.Context, r models.SpaceDeleted
 		s.rescheduleSpaceDeleted(ctx, r)
 		return
 	}
-	sp, err := s.spaceStore(nil, ref.Authority).getSpace(r.Space)
+	sp, err := s.spaceStore(s.db.Client().WithContext(ctx), ref.Authority).getSpace(r.Space)
 	if err != nil {
 		s.rescheduleSpaceDeleted(ctx, r)
 		return

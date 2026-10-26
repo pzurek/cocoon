@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/smtp"
 	"os"
@@ -99,6 +100,12 @@ type Server struct {
 
 	repoWriteLocks     sync.Map      // DID -> *sync.Mutex; shared by writes and imports.
 	reservationLimiter *rate.Limiter // guarded by the reserved-keys write lock.
+
+	// Set before accepting requests. Background work and hijacked streams are
+	// cancelled at shutdown; ordinary request contexts survive the drain.
+	workerCtx context.Context
+	// Zero uses five minutes, matching the import request timeout.
+	shutdownTimeout time.Duration
 
 	// spaceJobs tracks background Spaces work (notification fan-out).
 	spaceJobs sync.WaitGroup
@@ -427,6 +434,16 @@ func New(args *Args) (*Server, error) {
 	}
 
 	var gdb *gorm.DB
+	constructed := false
+	defer func() {
+		// GORM may return a non-nil DB together with an initialization/ping
+		// error, so also cover errors from Open itself.
+		if !constructed && gdb != nil {
+			if sqlDB, err := gdb.DB(); err == nil {
+				_ = sqlDB.Close()
+			}
+		}
+	}()
 	switch dbType {
 	case "postgres":
 		if args.DatabaseURL == "" {
@@ -448,6 +465,9 @@ func New(args *Args) (*Server, error) {
 		logger.Info("connected to SQLite database", "path", args.DbName)
 	}
 	dbw := db.NewDB(gdb)
+	if _, err := gdb.DB(); err != nil {
+		return nil, err
+	}
 
 	rkbytes, err := os.ReadFile(args.RotationKeyPath)
 	if err != nil {
@@ -500,6 +520,11 @@ func New(args *Args) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create event persister: %w", err)
 	}
+	defer func() {
+		if !constructed {
+			_ = evtPersister.Shutdown(context.Background())
+		}
+	}()
 
 	s := &Server{
 		http:       h,
@@ -584,6 +609,7 @@ func New(args *Args) (*Server, error) {
 		args.Logger.Info("no yubico api key configured; yubikeys must be programmed with a secret to be added")
 	}
 
+	constructed = true
 	return s, nil
 }
 
@@ -736,39 +762,139 @@ func (s *Server) Migrate() error {
 
 func (s *Server) Serve(ctx context.Context) error {
 	logger := s.logger.With("name", "Serve")
-
-	s.addRoutes()
-
-	logger.Info("migrating...")
-
-	if err := s.Migrate(); err != nil {
-		logger.Error("migrations failed", "err", err)
+	fail := func(err error) error {
+		return errors.Join(err, s.closeResources())
 	}
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	logger.Info("migrating...")
+	if err := s.Migrate(); err != nil {
+		return fail(fmt.Errorf("startup migrations: %w", err))
+	}
+	// Bind synchronously: a bind failure must be returned to the caller, not
+	// panic in an unobserved goroutine or start background jobs.
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", s.httpd.Addr)
+	if err != nil {
+		return fail(fmt.Errorf("listen: %w", err))
+	}
+	defer ln.Close()
+	s.addRoutes()
+	workerCtx, cancelWorkers := context.WithCancel(context.Background())
+	s.workerCtx = workerCtx
+	defer cancelWorkers()
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
+
+	// net/http does not wait for hijacked connections, and Close does not wait
+	// for handlers either. Count every accepted handler, with an admission gate
+	// so no Add can race the shutdown Wait (including late keep-alive requests).
+	var handlers sync.WaitGroup
+	var admission sync.Mutex
+	stopping := false
+	handler := s.httpd.Handler
+	s.httpd.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		admission.Lock()
+		if stopping {
+			admission.Unlock()
+			http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		handlers.Add(1)
+		admission.Unlock()
+		defer handlers.Done()
+		ctx, cancel := context.WithCancel(r.Context())
+		stop := context.AfterFunc(requestCtx, cancel)
+		defer stop()
+		defer cancel()
+		handler.ServeHTTP(w, r.WithContext(ctx))
+	})
 
 	logger.Info("starting cocoon")
-
-	go func() {
-		if err := s.httpd.ListenAndServe(); err != nil {
-			panic(err)
-		}
-	}()
-
-	go s.backupRoutine()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- s.httpd.Serve(ln) }()
+	var workers sync.WaitGroup
+	start := func(fn func(context.Context)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			fn(s.workerCtx)
+		}()
+	}
+	start(s.backupRoutine)
 	s.startSpaceWorkers()
-	go s.kemKeyBackfillRoutine(ctx)
-	go s.oauthTokenCleanupRoutine(ctx)
-
-	go func() {
-		if err := s.requestCrawl(ctx); err != nil {
+	start(s.kemKeyBackfillRoutine)
+	start(s.oauthTokenCleanupRoutine)
+	start(func(ctx context.Context) {
+		if err := s.requestCrawl(ctx); err != nil && ctx.Err() == nil {
 			logger.Error("error requesting crawls", "err", err)
 		}
+	})
+
+	var result error
+	select {
+	case <-ctx.Done():
+	case err := <-serveErr:
+		// Even ErrServerClosed is unexpected unless our shutdown initiated it.
+		result = fmt.Errorf("HTTP server stopped unexpectedly: %w", err)
+	}
+	admission.Lock()
+	stopping = true
+	admission.Unlock()
+	cancelWorkers()
+	if s.spaceWorker.cancel != nil {
+		s.spaceWorker.cancel()
+	}
+
+	timeout := s.shutdownTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), timeout)
+	defer cancelDrain()
+	// Cleanup continues even if a handler ignores forced cancellation. Never
+	// close its database underneath it. Serve still returns a bounded, explicit
+	// failure so a supervisor can terminate an uncooperative process.
+	drained := make(chan error, 1)
+	go func() {
+		err := s.httpd.Shutdown(drainCtx)
+		handlers.Wait()
+		workers.Wait()
+		s.stopSpaceWorkers()
+		drained <- errors.Join(err, s.closeResources())
 	}()
+	select {
+	case err := <-drained:
+		return errors.Join(result, err)
+	case <-drainCtx.Done():
+		result = errors.Join(result, fmt.Errorf("graceful shutdown deadline exceeded: %w", drainCtx.Err()))
+		cancelRequests()
+		result = errors.Join(result, s.httpd.Close())
+	}
+	// Allow cancelled handlers/SQL calls to unwind, but do not hang forever on
+	// code that ignores context cancellation.
+	forceTimer := time.NewTimer(5 * time.Second)
+	defer forceTimer.Stop()
+	select {
+	case err := <-drained:
+		return errors.Join(result, err)
+	case <-forceTimer.C:
+		return errors.Join(result, errors.New("forced shutdown incomplete; database cleanup deferred until handlers and workers exit"))
+	}
+}
 
-	<-ctx.Done()
-
-	fmt.Println("shut down")
-
-	return nil
+// Called only after all DB users have exited, or before startup accepts work.
+func (s *Server) closeResources() error {
+	if s.evtpersister != nil {
+		if err := s.evtpersister.Shutdown(context.Background()); err != nil {
+			return err
+		}
+	}
+	sqlDB, err := s.db.Client().DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
 }
 
 func (s *Server) requestCrawl(ctx context.Context) error {
@@ -776,6 +902,9 @@ func (s *Server) requestCrawl(ctx context.Context) error {
 	s.requestCrawlMu.Lock()
 	defer s.requestCrawlMu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	logger.Info("requesting crawl with configured relays")
 
 	if time.Since(s.lastRequestCrawl) <= 1*time.Minute {
@@ -800,9 +929,12 @@ func (s *Server) requestCrawl(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) doBackup() {
+func (s *Server) doBackup(ctx context.Context) {
 	logger := s.logger.With("name", "doBackup")
 
+	if ctx.Err() != nil {
+		return
+	}
 	if s.dbType == "postgres" {
 		logger.Info("skipping S3 backup - PostgreSQL backups should be handled externally (pg_dump, managed database backups, etc.)")
 		return
@@ -815,7 +947,7 @@ func (s *Server) doBackup() {
 	tmpFile := fmt.Sprintf("/tmp/cocoon-backup-%s.db", time.Now().Format(time.RFC3339Nano))
 	defer os.Remove(tmpFile)
 
-	if err := s.db.Client().Exec(fmt.Sprintf("VACUUM INTO '%s'", tmpFile)).Error; err != nil {
+	if err := s.db.Client().WithContext(ctx).Exec("VACUUM INTO ?", tmpFile).Error; err != nil {
 		logger.Error("error creating tmp backup file", "err", err)
 		return
 	}
@@ -849,7 +981,7 @@ func (s *Server) doBackup() {
 
 	svc := s3.New(sess)
 
-	if _, err := svc.PutObject(&s3.PutObjectInput{
+	if _, err := svc.PutObjectWithContext(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.s3Config.Bucket),
 		Key:    aws.String(key),
 		Body:   bytes.NewReader(backupData),
@@ -863,7 +995,7 @@ func (s *Server) doBackup() {
 	os.WriteFile("last-backup.txt", []byte(time.Now().Format(time.RFC3339Nano)), 0644)
 }
 
-func (s *Server) backupRoutine() {
+func (s *Server) backupRoutine(ctx context.Context) {
 	logger := s.logger.With("name", "backupRoutine")
 
 	if s.s3Config == nil || !s.s3Config.BackupsEnabled {
@@ -904,12 +1036,18 @@ func (s *Server) backupRoutine() {
 	}
 
 	if shouldBackupNow {
-		go s.doBackup()
+		s.doBackup(ctx)
 	}
 
 	ticker := time.NewTicker(time.Hour)
-	for range ticker.C {
-		go s.doBackup()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.doBackup(ctx)
+		}
 	}
 }
 

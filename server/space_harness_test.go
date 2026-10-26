@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/haileyok/cocoon/identity"
 	"github.com/haileyok/cocoon/models"
@@ -107,6 +108,21 @@ func TestSpacesDisabledPreservesQueuedNotifications(t *testing.T) {
 	for _, disabled := range []bool{true, false} {
 		s.config.DisableSpaces = disabled
 		s.startSpaceWorkers()
+		if !disabled {
+			// Stop now cancels an active pass; wait for the enabled worker's
+			// effect before stopping rather than relying on stop to run a pass.
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				var count int64
+				if err := s.db.Client().Model(&write).Count(&count).Error; err != nil {
+					t.Fatal(err)
+				}
+				if count == 0 || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
 		s.stopSpaceWorkers()
 		for _, row := range []any{&write, &deleted} {
 			var count int64

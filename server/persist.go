@@ -27,7 +27,9 @@ type DbPersister struct {
 	Broadcast func(*events.XRPCStreamEvent)
 
 	// how long do we actually want to keep these things around
-	Retention time.Duration
+	Retention     time.Duration
+	cleanupCancel context.CancelFunc
+	cleanupDone   chan struct{}
 }
 
 func NewDbPersister(db *gorm.DB, retention time.Duration) (*DbPersister, error) {
@@ -57,7 +59,13 @@ func NewDbPersister(db *gorm.DB, retention time.Duration) (*DbPersister, error) 
 		p.Seq = lastEvent.Seq
 	}
 
-	go p.cleanupRoutine()
+	ctx, cancel := context.WithCancel(context.Background())
+	p.cleanupCancel = cancel
+	p.cleanupDone = make(chan struct{})
+	go func() {
+		defer close(p.cleanupDone)
+		p.cleanupRoutine(ctx)
+	}()
 
 	return p, nil
 }
@@ -211,17 +219,29 @@ func (p *DbPersister) Flush(ctx context.Context) error {
 }
 
 func (p *DbPersister) Shutdown(ctx context.Context) error {
-	return nil
+	if p.cleanupCancel == nil {
+		return nil
+	}
+	p.cleanupCancel()
+	select {
+	case <-p.cleanupDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
-func (p *DbPersister) cleanupRoutine() {
+func (p *DbPersister) cleanupRoutine(ctx context.Context) {
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		cutoff := time.Now().Add(-p.Retention)
-		if err := p.Db.Where("created_at < ?", cutoff).Delete(&models.EventRecord{}).Error; err != nil {
-			continue
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-p.Retention)
+			p.Db.WithContext(ctx).Where("created_at < ?", cutoff).Delete(&models.EventRecord{})
 		}
 	}
 }

@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bluesky-social/go-util/pkg/telemetry"
@@ -215,8 +217,12 @@ func main() {
 		Version:   Version,
 	}
 
-	if err := app.Run(os.Args); err != nil {
-		fmt.Printf("Error: %v\n", err)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	err := app.RunContext(ctx, os.Args)
+	stop()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 }
 

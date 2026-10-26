@@ -192,7 +192,7 @@ func (s *Server) authorizeSpaceUser(ctx context.Context, cfg *models.Simplespace
 	case policyPublic:
 		return true, nil
 	case policyMemberList:
-		m, err := s.spaceStore(nil, ref.Authority).getMember(cfg.Uri, userDid)
+		m, err := s.spaceStore(s.db.Client().WithContext(ctx), ref.Authority).getMember(cfg.Uri, userDid)
 		if err != nil || m == nil {
 			return false, err
 		}
@@ -467,12 +467,16 @@ func (s *Server) deleteSpace(ctx context.Context, ref space.Ref) error {
 	return nil
 }
 
-// goSpace runs background space work, tracked so tests can wait for it.
+// goSpace runs space work under the worker lifetime, tracked for shutdown.
 func (s *Server) goSpace(fn func(ctx context.Context)) {
+	parent := s.workerCtx
+	if parent == nil {
+		parent = context.Background()
+	}
 	s.spaceJobs.Add(1)
 	go func() {
 		defer s.spaceJobs.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 		defer cancel()
 		fn(ctx)
 	}()

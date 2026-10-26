@@ -145,6 +145,10 @@ func writeEventFrame(conn *websocket.Conn, header *events.EventHeader, evt *even
 func (s *Server) handleSyncSubscribeRepos(e echo.Context) error {
 	ctx, cancel := context.WithCancel(e.Request().Context())
 	defer cancel()
+	if s.workerCtx != nil {
+		stop := context.AfterFunc(s.workerCtx, cancel)
+		defer stop()
+	}
 
 	logger := s.logger.With("component", "subscribe-repos-websocket")
 
@@ -162,14 +166,26 @@ func (s *Server) handleSyncSubscribeRepos(e echo.Context) error {
 	// Send a close frame first: a bare TCP close is indistinguishable from a
 	// crash on the peer's side — the relay logs it as "close 1006 (abnormal
 	// closure)" — which turns a routine teardown into an apparent outage.
-	defer func() {
+	// Cancellation must also interrupt a blocked frame write or reader, not
+	// merely the forward loop. Join the closer and reader before returning.
+	closed := make(chan struct{})
+	var readerDone chan struct{}
+	context.AfterFunc(ctx, func() {
+		defer close(closed)
 		if err := conn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseGoingAway, ""),
-			time.Now().Add(wsWriteTimeout)); err != nil && !errors.Is(err, websocket.ErrCloseSent) {
+			time.Now().Add(time.Second)); err != nil && !errors.Is(err, websocket.ErrCloseSent) {
 			logger.Warn("error sending websocket close frame", "err", err)
 		}
 		if err := conn.Close(); err != nil {
 			logger.Warn("error closing websocket", "err", err)
+		}
+	})
+	defer func() {
+		cancel()
+		<-closed
+		if readerDone != nil {
+			<-readerDone
 		}
 	}()
 
@@ -280,10 +296,19 @@ func (s *Server) handleSyncSubscribeRepos(e echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer evtManCancel()
+	defer func() {
+		cancel()
+		evtManCancel()
+		// Cursor subscriptions run playback in another goroutine. Its output
+		// closes only when playback has stopped using the database.
+		for range evts {
+		}
+	}()
 
 	// drop the connection whenever a subscriber disconnects from the socket, we should get errors
+	readerDone = make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		for {
 			select {
 			case <-ctx.Done():
@@ -343,15 +368,19 @@ forward:
 		}
 	}
 
-	// we should tell the relay to request a new crawl at this point if we got disconnected
-	// use a new context since the old one might be cancelled at this point
-	go func() {
-		retryCtx, retryCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Do not launch an untracked crawl during shutdown. Keep an ordinary
+	// disconnect retry in this tracked handler and under the worker lifetime.
+	parent := s.workerCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	if parent.Err() == nil {
+		retryCtx, retryCancel := context.WithTimeout(parent, 10*time.Second)
 		defer retryCancel()
 		if err := s.requestCrawl(retryCtx); err != nil {
 			logger.Error("error requesting crawls", "err", err)
 		}
-	}()
+	}
 
 	return nil
 }

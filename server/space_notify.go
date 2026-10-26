@@ -168,7 +168,7 @@ func (s *Server) processNotifyWrite(ctx context.Context, body notifyWriteBody) e
 	if tid.Time().After(time.Now().Add(notifyFutureRevAllowed)) {
 		return errInvalid("FutureRev", "Repo revision is in the future")
 	}
-	st := s.spaceStore(nil, ref.Authority)
+	st := s.spaceStore(s.db.Client().WithContext(ctx), ref.Authority)
 	sp, err := st.getSpace(ref.String())
 	if err != nil {
 		return err
@@ -499,10 +499,10 @@ func (s *Server) handleSpaceGetRepo(e echo.Context) error {
 // The retry worker -------------------------------------------------------
 
 type spaceWorker struct {
-	once sync.Once
-	stop chan struct{}
-	done chan struct{}
-	mu   sync.Mutex // one retry pass at a time
+	once   sync.Once
+	cancel context.CancelFunc
+	done   chan struct{}
+	mu     sync.Mutex // one retry pass at a time
 }
 
 // startSpaceWorkers starts the notification retry worker.
@@ -511,16 +511,21 @@ func (s *Server) startSpaceWorkers() {
 		return
 	}
 	s.spaceWorker.once.Do(func() {
-		s.spaceWorker.stop = make(chan struct{})
+		parent := s.workerCtx
+		if parent == nil {
+			parent = context.Background()
+		}
+		ctx, cancel := context.WithCancel(parent)
+		s.spaceWorker.cancel = cancel
 		s.spaceWorker.done = make(chan struct{})
 		go func() {
 			defer close(s.spaceWorker.done)
 			t := time.NewTicker(notifyRetryPollEvery)
 			defer t.Stop()
-			for {
-				s.retrySpaceNotifications(context.Background())
+			for ctx.Err() == nil {
+				s.retrySpaceNotifications(ctx)
 				select {
-				case <-s.spaceWorker.stop:
+				case <-ctx.Done():
 					return
 				case <-t.C:
 				}
@@ -531,12 +536,8 @@ func (s *Server) startSpaceWorkers() {
 
 // stopSpaceWorkers stops the retry worker and waits for background work.
 func (s *Server) stopSpaceWorkers() {
-	if s.spaceWorker.stop != nil {
-		select {
-		case <-s.spaceWorker.stop:
-		default:
-			close(s.spaceWorker.stop)
-		}
+	if s.spaceWorker.cancel != nil {
+		s.spaceWorker.cancel()
 		<-s.spaceWorker.done
 	}
 	s.spaceJobs.Wait()
@@ -547,12 +548,15 @@ func (s *Server) retrySpaceNotifications(ctx context.Context) {
 	s.spaceWorker.mu.Lock()
 	defer s.spaceWorker.mu.Unlock()
 	s.retrySpaceDeletedNotifications(ctx)
-	for {
+	for ctx.Err() == nil {
 		var due []models.SpaceNotificationRetry
 		if err := s.db.Client().WithContext(ctx).Where("retry_at <= ?", time.Now().UnixMilli()).Order("retry_at").Limit(5).Find(&due).Error; err != nil || len(due) == 0 {
 			return
 		}
 		for _, r := range due {
+			if ctx.Err() != nil {
+				return
+			}
 			s.retryNotifyOne(ctx, r)
 		}
 	}
