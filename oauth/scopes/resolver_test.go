@@ -229,6 +229,19 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 			defer plc.Close()
 			r := NewIndigoResolverWithPLCURL(plc.URL)
 			r.dns.Resolver = net.Resolver{PreferGo: true, Dial: dns.Dial}
+			localChecks := 0
+			r.SetLocalLexiconReader(func(_ context.Context, authority syntax.DID, nsid syntax.NSID) ([]byte, bool, error) {
+				localChecks++
+				if authority != did || nsid != "com.example.lexicon" {
+					t.Fatalf("wrong local lookup before remote fallback: %s/%s", authority, nsid)
+				}
+				return nil, false, nil
+			})
+			t.Cleanup(func() {
+				if localChecks != 1 {
+					t.Errorf("remote fallback local checks=%d, want 1", localChecks)
+				}
+			})
 			roots := x509.NewCertPool()
 			roots.AddCert(pds.Certificate())
 			r.httpClient = newLexiconHTTPClient("",
