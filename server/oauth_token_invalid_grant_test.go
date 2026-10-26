@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
@@ -14,7 +15,9 @@ import (
 
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/golang-jwt/jwt/v4"
+	"github.com/haileyok/cocoon/oauth/constants"
 	"github.com/haileyok/cocoon/oauth/provider"
+	"github.com/lestrrat-go/jwx/v2/jwk"
 )
 
 // postOauthToken drives /oauth/token through the full router with a fresh
@@ -231,6 +234,129 @@ func TestOauthTokenRefreshRotation(t *testing.T) {
 				t.Fatalf("winner's refresh token unusable after replay: %d %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+func TestOauthRefreshRechecksAfterScopeResolution(t *testing.T) {
+	for _, method := range []string{"none", "private_key_jwt"} {
+		for _, change := range []string{"valid", "session expiry", "refresh expiry", "revocation", "token deletion", "account deletion"} {
+			t.Run(method+"/"+change, func(t *testing.T) {
+				s, account := endpointTestServer(t)
+				ctx := t.Context()
+				auth, _ := authorizationCodeFixture(t, s, account)
+				auth.Parameters.Scope = "atproto include:com.example.permissions"
+				form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"old-refresh"}}
+				sessionLifetime, refreshLifetime := 14*24*time.Hour, 14*24*time.Hour
+				if method == "private_key_jwt" {
+					sessionLifetime, refreshLifetime = 730*24*time.Hour, 90*24*time.Hour
+					key, err := jwk.FromRaw(s.privateKey.Public())
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := key.Set(jwk.KeyIDKey, "refresh-client"); err != nil {
+						t.Fatal(err)
+					}
+					metadata := map[string]any{
+						"redirect_uris": []string{"https://example.com/callback"}, "response_types": []string{"code"},
+						"grant_types": []string{"authorization_code", "refresh_token"}, "scope": "atproto",
+						"application_type": "web", "token_endpoint_auth_method": method,
+						"token_endpoint_auth_signing_alg": "ES256", "dpop_bound_access_tokens": true,
+						"jwks": map[string]any{"keys": []any{key}},
+					}
+					clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "application/json")
+						_ = json.NewEncoder(w).Encode(metadata)
+					}))
+					t.Cleanup(clientServer.Close)
+					auth.ClientId = clientServer.URL + "/client-metadata.json"
+					metadata["client_id"] = auth.ClientId
+					assertion := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+						"iss": auth.ClientId, "sub": auth.ClientId, "aud": "https://" + testHostname,
+						"iat": time.Now().Unix(), "jti": "refresh-assertion",
+					})
+					assertion.Header["kid"] = "refresh-client"
+					signed, err := assertion.SignedString(s.privateKey)
+					if err != nil {
+						t.Fatal(err)
+					}
+					form.Set("client_assertion_type", constants.ClientAssertionTypeJwtBearer)
+					form.Set("client_assertion", signed)
+				}
+				form.Set("client_id", auth.ClientId)
+				token := provider.OauthToken{
+					ClientId: auth.ClientId, ClientAuth: provider.ClientAuth{Method: method}, Sub: account.Did,
+					Parameters: auth.Parameters, Token: "old-access", RefreshToken: "old-refresh",
+					ExpiresAt: time.Now().Add(-time.Hour), SessionVersion: 7,
+				}
+				// Valid refreshes may outlive access tokens and, for confidential clients, two weeks.
+				token.CreatedAt = time.Now().Add(-sessionLifetime + 24*time.Hour)
+				token.UpdatedAt = time.Now().Add(-refreshLifetime + 24*time.Hour)
+				if err := s.db.Exec(ctx, "UPDATE repos SET session_version = ? WHERE did = ?", nil, token.SessionVersion, account.Did).Error; err != nil {
+					t.Fatal(err)
+				}
+				if err := s.db.Create(ctx, &token, nil).Error; err != nil {
+					t.Fatal(err)
+				}
+				resolved := false
+				s.scopeResolver = codeExchangeResolver(func(ctx context.Context) {
+					resolved = true
+					var err error
+					switch change {
+					case "session expiry", "refresh expiry":
+						expires := time.Now().Add(20 * time.Millisecond)
+						column, lifetime := "created_at", sessionLifetime
+						if change == "refresh expiry" {
+							column, lifetime = "updated_at", refreshLifetime
+						}
+						err = s.db.Exec(ctx, "UPDATE oauth_tokens SET "+column+" = ? WHERE id = ?", nil, expires.Add(-lifetime), token.ID).Error
+						time.Sleep(time.Until(expires) + time.Millisecond)
+					case "revocation":
+						err = s.db.Exec(ctx, "UPDATE repos SET session_version = session_version + 1 WHERE did = ?", nil, account.Did).Error
+					case "token deletion":
+						err = s.db.Exec(ctx, "DELETE FROM oauth_tokens WHERE id = ?", nil, token.ID).Error
+					case "account deletion":
+						err = s.db.Exec(ctx, "DELETE FROM repos WHERE did = ?", nil, account.Did).Error
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+				})
+				w := httptest.NewRecorder()
+				s.echo.ServeHTTP(w, authorizationCodeRequest(t, s, form))
+				if !resolved {
+					t.Fatalf("request did not reach scope resolution: %d %s", w.Code, w.Body.String())
+				}
+				if change == "valid" {
+					if w.Code != 200 {
+						t.Fatalf("valid refresh rejected: %d %s", w.Code, w.Body.String())
+					}
+					var response OauthTokenResponse
+					if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+						t.Fatal(err)
+					}
+					var stored provider.OauthToken
+					if err := s.db.First(ctx, &stored, "token = ?", response.AccessToken).Error; err != nil {
+						t.Fatal(err)
+					}
+					if stored.RefreshToken != response.RefreshToken || !stored.CreatedAt.Equal(token.CreatedAt) || !stored.UpdatedAt.After(token.UpdatedAt) {
+						t.Fatal("rotation must preserve session creation time and renew refresh time")
+					}
+				} else {
+					assertInvalidGrant(t, w)
+					var rotated int64
+					if err := s.db.Raw(ctx, "SELECT COUNT(*) FROM oauth_tokens WHERE token != ? OR refresh_token != ?", nil, token.Token, token.RefreshToken).Scan(&rotated).Error; err != nil {
+						t.Fatal(err)
+					}
+					wantCount := int64(1)
+					if change == "token deletion" {
+						wantCount = 0
+					}
+					if rotated != 0 || countOauthTokens(t, s) != wantCount {
+						t.Fatal("rejected refresh changed stored credentials")
+					}
+				}
+			})
+		}
 	}
 }
 
