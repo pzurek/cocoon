@@ -1,15 +1,18 @@
 package server
 
 import (
-	"bytes"
-	"fmt"
-	"github.com/Azure/go-autorest/autorest/to"
+	"context"
+	"crypto/sha256"
+	"errors"
 	"io"
+	"net/http"
+	"os"
+	"time"
 
+	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/haileyok/cocoon/internal/db"
 	"github.com/haileyok/cocoon/internal/helpers"
 	"github.com/haileyok/cocoon/models"
 	"github.com/ipfs/go-cid"
@@ -18,7 +21,8 @@ import (
 )
 
 const (
-	blockSize = 0x10000
+	blockSize                    = 0x10000
+	DefaultBlobUploadLimit int64 = 5 * 1024 * 1024
 )
 
 type ComAtprotoRepoUploadBlobResponse struct {
@@ -46,97 +50,44 @@ func (s *Server) handleRepoUploadBlob(e echo.Context) error {
 		mime = "application/octet-stream"
 	}
 
-	storage := "sqlite"
-	s3Upload := s.s3Config != nil && s.s3Config.BlobstoreEnabled
-	if s3Upload {
-		storage = "s3"
+	limit := s.config.BlobUploadLimit
+	if limit == 0 {
+		limit = DefaultBlobUploadLimit
 	}
-	blob := models.Blob{
-		Did:       urepo.Repo.Did,
-		RefCount:  0,
-		CreatedAt: s.repoman.clock.Next().String(),
-		Storage:   storage,
+	if e.Request().ContentLength > limit {
+		return helpers.InputError(e, to.StringPtr("BlobTooLarge"))
 	}
-
-	if err := s.db.Create(ctx, &blob, nil).Error; err != nil {
-		logger.Error("error creating new blob in db", "error", err)
-		return helpers.ServerError(e, nil)
-	}
-
-	read := 0
-	part := 0
-
-	buf := make([]byte, 0x10000)
-	fulldata := new(bytes.Buffer)
-
-	for {
-		n, err := io.ReadFull(e.Request().Body, buf)
-		if err == io.ErrUnexpectedEOF || err == io.EOF {
-			if n == 0 {
-				break
-			}
-		} else if err != nil && err != io.ErrUnexpectedEOF {
-			logger.Error("error reading blob", "error", err)
-			return helpers.ServerError(e, nil)
-		}
-
-		data := buf[:n]
-		read += n
-		fulldata.Write(data)
-
-		if !s3Upload {
-			blobPart := models.BlobPart{
-				BlobID: blob.ID,
-				Idx:    part,
-				Data:   data,
-			}
-
-			if err := s.db.Create(ctx, &blobPart, nil).Error; err != nil {
-				logger.Error("error adding blob part to db", "error", err)
-				return helpers.ServerError(e, nil)
-			}
-		}
-		part++
-
-		if n < blockSize {
-			break
-		}
-	}
-
-	c, err := cid.NewPrefixV1(cid.Raw, multihash.SHA2_256).Sum(fulldata.Bytes())
+	// Spool and hash with bounded memory before creating any persistent rows.
+	// The same seekable file supports S3 signing/retries without a RAM copy.
+	file, err := os.CreateTemp("", "cocoon-upload-*")
 	if err != nil {
-		logger.Error("error creating cid prefix", "error", err)
+		logger.Error("error creating upload file", "error", err)
 		return helpers.ServerError(e, nil)
 	}
-
-	if s3Upload {
-		config := &aws.Config{
-			Region:      aws.String(s.s3Config.Region),
-			Credentials: credentials.NewStaticCredentials(s.s3Config.AccessKey, s.s3Config.SecretKey, ""),
+	defer os.Remove(file.Name())
+	defer file.Close()
+	hash := sha256.New()
+	body := http.MaxBytesReader(e.Response(), e.Request().Body, limit)
+	defer body.Close()
+	read, err := io.Copy(io.MultiWriter(file, hash), body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return helpers.InputError(e, to.StringPtr("BlobTooLarge"))
 		}
-
-		if s.s3Config.Endpoint != "" {
-			config.Endpoint = aws.String(s.s3Config.Endpoint)
-			config.S3ForcePathStyle = aws.Bool(true)
-		}
-
-		sess, err := session.NewSession(config)
-		if err != nil {
-			logger.Error("error creating aws session", "error", err)
-			return helpers.ServerError(e, nil)
-		}
-
-		svc := s3.New(sess)
-
-		if _, err := svc.PutObject(&s3.PutObjectInput{
-			Bucket: aws.String(s.s3Config.Bucket),
-			Key:    aws.String(fmt.Sprintf("blobs/%s/%s", urepo.Repo.Did, c.String())),
-			Body:   bytes.NewReader(fulldata.Bytes()),
-		}); err != nil {
-			logger.Error("error uploading blob to s3", "error", err)
-			return helpers.ServerError(e, nil)
-		}
+		logger.Error("error reading blob", "error", err)
+		return helpers.ServerError(e, nil)
 	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		logger.Error("error rewinding upload", "error", err)
+		return helpers.ServerError(e, nil)
+	}
+	digest, err := multihash.Encode(hash.Sum(nil), multihash.SHA2_256)
+	if err != nil {
+		logger.Error("error encoding blob digest", "error", err)
+		return helpers.ServerError(e, nil)
+	}
+	c := cid.NewCidV1(cid.Raw, digest)
 
 	unlock := s.lockRepoWrite(urepo.Repo.Did)
 	defer unlock()
@@ -150,8 +101,66 @@ func (s *Server) handleRepoUploadBlob(e echo.Context) error {
 		logger.Error("error decoding blob references", "error", err)
 		return helpers.ServerError(e, nil)
 	}
-	if err := s.db.Exec(ctx, "UPDATE blobs SET cid = ?, ref_count = ? WHERE id = ?", nil, c.Bytes(), refs[c], blob.ID).Error; err != nil {
-		logger.Error("error updating blob", "error", err)
+	blob := models.Blob{Did: urepo.Repo.Did, Cid: c.Bytes(), RefCount: refs[c], CreatedAt: s.repoman.clock.Next().String(), Storage: "sqlite"}
+	s3Upload := s.s3Config != nil && s.s3Config.BlobstoreEnabled
+	commitPossible := false
+	if s3Upload {
+		blob.Storage = "s3"
+		svc, err := s.s3Client()
+		if err != nil {
+			return helpers.ServerError(e, nil)
+		}
+		var existing int64
+		if err := s.db.Client().WithContext(ctx).Model(&models.Blob{}).Where("did = ? AND cid = ? AND storage = ?", blob.Did, blob.Cid, "s3").Count(&existing).Error; err != nil {
+			return helpers.ServerError(e, nil)
+		}
+		key := s3BlobKey(blob.Did, c)
+		// The repository lock serializes same-CID publication and cleanup.
+		// Never remove an object backing an earlier successful upload.
+		if existing == 0 {
+			defer func() {
+				if commitPossible {
+					return
+				}
+				cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				if _, err := svc.DeleteObjectWithContext(cleanup, &s3.DeleteObjectInput{Bucket: aws.String(s.s3Config.Bucket), Key: aws.String(key)}); err != nil {
+					logger.Error("error removing failed S3 upload", "key", key, "error", err)
+				}
+			}()
+		}
+		if _, err := svc.PutObjectWithContext(ctx, &s3.PutObjectInput{Bucket: aws.String(s.s3Config.Bucket), Key: aws.String(key), Body: file}); err != nil {
+			logger.Error("error uploading blob to s3", "error", err)
+			return helpers.ServerError(e, nil)
+		}
+	}
+	if err := s.db.Transaction(ctx, func(tx *db.DB) error {
+		if err := tx.Create(ctx, &blob, nil).Error; err != nil {
+			return err
+		}
+		if s3Upload {
+			// A COMMIT error may mean only its acknowledgment was lost.
+			// Retain the object once commit is possible, even on error.
+			commitPossible = true
+			return nil
+		}
+		buf := make([]byte, blockSize)
+		for part := 0; ; part++ {
+			n, err := io.ReadFull(file, buf)
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				return err
+			}
+			if n > 0 {
+				if err := tx.Create(ctx, &models.BlobPart{BlobID: blob.ID, Idx: part, Data: buf[:n]}, nil).Error; err != nil {
+					return err
+				}
+			}
+			if err != nil {
+				return nil
+			}
+		}
+	}); err != nil {
+		logger.Error("error persisting blob", "error", err)
 		return helpers.ServerError(e, nil)
 	}
 
@@ -159,7 +168,7 @@ func (s *Server) handleRepoUploadBlob(e echo.Context) error {
 	resp.Blob.Type = "blob"
 	resp.Blob.Ref.Link = c.String()
 	resp.Blob.MimeType = mime
-	resp.Blob.Size = read
+	resp.Blob.Size = int(read)
 
 	return e.JSON(200, resp)
 }

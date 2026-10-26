@@ -345,8 +345,8 @@ func TestUploadPublicationSerializesWithImport(t *testing.T) {
 	paused, resume := make(chan struct{}), make(chan struct{})
 	release := sync.OnceFunc(func() { close(resume) })
 	defer release()
-	if err := s.db.Client().Callback().Raw().Before("gorm:raw").Register("pause-upload-publication", func(tx *gorm.DB) {
-		if tx.Statement.SQL.String() == "UPDATE blobs SET cid = ?, ref_count = ? WHERE id = ?" {
+	if err := s.db.Client().Callback().Create().Before("gorm:create").Register("pause-upload-publication", func(tx *gorm.DB) {
+		if tx.Statement.Table == "blobs" {
 			close(paused)
 			select {
 			case <-resume:

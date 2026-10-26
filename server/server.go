@@ -146,6 +146,7 @@ type Args struct {
 	RequireInvite      bool
 	DisableSpaces      bool
 	KEMBackfillEnabled bool
+	BlobUploadLimit    int64
 
 	SmtpUser  string
 	SmtpPass  string
@@ -186,6 +187,7 @@ type config struct {
 	RequireInvite      bool
 	DisableSpaces      bool
 	KEMBackfillEnabled bool
+	BlobUploadLimit    int64
 	SmtpEmail          string
 	SmtpName           string
 	SessionCookieKey   string
@@ -318,6 +320,13 @@ func New(args *Args) (*Server, error) {
 	}
 
 	logger := args.Logger.With("name", "New")
+
+	if args.BlobUploadLimit < 0 {
+		return nil, fmt.Errorf("blob upload limit must not be negative")
+	}
+	if args.BlobUploadLimit == 0 {
+		args.BlobUploadLimit = DefaultBlobUploadLimit
+	}
 
 	if args.Addr == "" {
 		return nil, fmt.Errorf("addr must be set")
@@ -512,6 +521,7 @@ func New(args *Args) (*Server, error) {
 			RequireInvite:      args.RequireInvite,
 			DisableSpaces:      args.DisableSpaces,
 			KEMBackfillEnabled: args.KEMBackfillEnabled,
+			BlobUploadLimit:    args.BlobUploadLimit,
 			SmtpName:           args.SmtpName,
 			SmtpEmail:          args.SmtpEmail,
 			SessionCookieKey:   args.SessionCookieKey,

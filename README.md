@@ -136,6 +136,19 @@ COCOON_SMTP_EMAIL="noreply@example.com"
 COCOON_SMTP_NAME="Cocoon PDS"
 ```
 
+#### Blob Upload Limit
+
+`com.atproto.repo.uploadBlob` accepts at most 5 MiB (5,242,880 bytes) by default,
+including requests without a Content-Length header. Set `COCOON_BLOB_UPLOAD_LIMIT`
+or `--blob-upload-limit` to a positive byte count to change it; zero uses the
+default and negative values are rejected. Larger uploads return `BlobTooLarge`.
+
+Uploads spool to temporary files before persistence, so provision temporary disk
+space for concurrent uploads. SQLite blob metadata and parts commit together.
+Failed S3 uploads receive best-effort cleanup. Objects are retained when a
+database commit's outcome is uncertain, to avoid deleting committed data. This
+is not crash-safe garbage collection or an aggregate storage quota.
+
 #### S3 Storage
 
 Cocoon supports S3-compatible storage for both database backups (SQLite only) and blob storage (images, videos, etc.):

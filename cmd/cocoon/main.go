@@ -101,6 +101,12 @@ func main() {
 				Usage:   "Opt in to automatic KEM-key backfill, which may publish signed PLC identity updates",
 				EnvVars: []string{"COCOON_KEM_BACKFILL_ENABLED"},
 			},
+			&cli.Int64Flag{
+				Name:    "blob-upload-limit",
+				Usage:   "Maximum blob upload size in bytes (zero uses the default)",
+				EnvVars: []string{"COCOON_BLOB_UPLOAD_LIMIT"},
+				Value:   server.DefaultBlobUploadLimit,
+			},
 			&cli.StringFlag{
 				Name:    "smtp-user",
 				EnvVars: []string{"COCOON_SMTP_USER"},
@@ -262,6 +268,7 @@ var runServe = &cli.Command{
 			RequireInvite:      cmd.Bool("require-invite"),
 			DisableSpaces:      !cmd.Bool("spaces-enabled"),
 			KEMBackfillEnabled: cmd.Bool("kem-backfill-enabled"),
+			BlobUploadLimit:    cmd.Int64("blob-upload-limit"),
 			SmtpUser:           cmd.String("smtp-user"),
 			SmtpPass:           cmd.String("smtp-pass"),
 			SmtpHost:           cmd.String("smtp-host"),
