@@ -789,6 +789,23 @@ func (s *Server) Migrate() error {
 	return errors.Join(errs...)
 }
 
+// serveListener binds addr for the HTTP server with Multipath TCP explicitly
+// disabled. Go 1.24 enabled MPTCP on listeners by default on Linux, and a
+// GODEBUG value in the environment overrides the go.mod default, so the socket
+// is opted out here where nothing in the environment can turn it back on.
+// Cocoon only ever speaks plain TCP.
+func serveListener(ctx context.Context, addr string) (net.Listener, error) {
+	// ListenAndServe defaulted to :http for an empty address; keep that.
+	if addr == "" {
+		addr = ":http"
+	}
+
+	var lc net.ListenConfig
+	lc.SetMultipathTCP(false)
+
+	return lc.Listen(ctx, "tcp", addr)
+}
+
 func (s *Server) Serve(ctx context.Context) error {
 	logger := s.logger.With("name", "Serve")
 	fail := func(err error) error {
@@ -803,7 +820,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	// Bind synchronously: a bind failure must be returned to the caller, not
 	// panic in an unobserved goroutine or start background jobs.
-	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", s.httpd.Addr)
+	ln, err := serveListener(ctx, s.httpd.Addr)
 	if err != nil {
 		return fail(fmt.Errorf("listen: %w", err))
 	}

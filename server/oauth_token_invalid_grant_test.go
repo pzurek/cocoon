@@ -232,8 +232,11 @@ func TestOauthTokenRefreshRotation(t *testing.T) {
 			}
 			claims := parsed.Claims.(jwt.MapClaims)
 			cnf, ok := claims["cnf"].(map[string]any)
-			if !ok || cnf["jkt"] != *auth.Parameters.DpopJkt || claims["scope"] != wantScope {
-				t.Fatal("JWT scope or DPoP confirmation differs from the refreshed grant")
+			if !ok || cnf["jkt"] != *auth.Parameters.DpopJkt {
+				t.Fatal("JWT DPoP confirmation differs from the refreshed grant")
+			}
+			if _, present := claims["scope"]; present {
+				t.Fatal("JWT duplicates database-backed scopes")
 			}
 			if name != "concurrent" {
 				// Keep rotating: replay of any superseded token must find the session,
