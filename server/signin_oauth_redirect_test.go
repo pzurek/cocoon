@@ -563,12 +563,47 @@ func TestAuthorizeAcceptRenewsCodeExpiry(t *testing.T) {
 	if auth.ExpiresAt.Before(before.Add(constants.AuthorizationInactivityTimeout)) || auth.ExpiresAt.After(after.Add(constants.AuthorizationInactivityTimeout)) {
 		t.Errorf("code expiry %s was not renewed at acceptance", auth.ExpiresAt)
 	}
+	acceptedExpiry := auth.ExpiresAt
+	w = sameOriginPost(s, cookie, "/oauth/authorize", url.Values{
+		"request_uri": {oauth.EncodeRequestUri(auth.RequestId)}, "accept_or_reject": {"accept"},
+	})
+	if w.Code != 400 {
+		t.Fatalf("second acceptance: %d %s", w.Code, w.Body.String())
+	}
+	if err := s.db.First(context.Background(), &auth, "request_id = ?", auth.RequestId).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !auth.ExpiresAt.Equal(acceptedExpiry) || auth.Code == nil || *auth.Code != exchange.Get("code") {
+		t.Fatal("second acceptance changed the code or its expiry")
+	}
 	// The redirect/exchange can outlive the pending request's remaining lifetime.
 	time.Sleep(time.Until(oldExpiry) + time.Millisecond)
 	w = httptest.NewRecorder()
 	s.echo.ServeHTTP(w, authorizationCodeRequest(t, s, exchange))
 	if w.Code != 200 || countOauthTokens(t, s) != 1 {
 		t.Fatalf("exchange after original PAR expiry: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAuthorizeAcceptDoesNotRenewExpiredRequest(t *testing.T) {
+	s, _, cookie := manageServer(t)
+	insertAuthRequest(t, s, "expired-request")
+	expiry := time.Now().Add(-time.Second)
+	if err := s.db.Exec(t.Context(), "UPDATE oauth_authorization_requests SET expires_at = ? WHERE request_id = ?", nil, expiry, "expired-request").Error; err != nil {
+		t.Fatal(err)
+	}
+	w := sameOriginPost(s, cookie, "/oauth/authorize", url.Values{
+		"request_uri": {oauth.EncodeRequestUri("expired-request")}, "accept_or_reject": {"accept"},
+	})
+	if w.Code != 400 {
+		t.Fatalf("expired request acceptance: %d %s", w.Code, w.Body.String())
+	}
+	var auth provider.OauthAuthorizationRequest
+	if err := s.db.First(t.Context(), &auth, "request_id = ?", "expired-request").Error; err != nil {
+		t.Fatal(err)
+	}
+	if auth.Code != nil || auth.Sub != nil || !auth.ExpiresAt.Equal(expiry) {
+		t.Fatal("expired request was renewed or authorized")
 	}
 }
 
