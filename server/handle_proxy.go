@@ -11,38 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bluesky-social/gttp"
 	"github.com/google/uuid"
 	"github.com/haileyok/cocoon/internal/helpers"
 	"github.com/haileyok/cocoon/models"
 	"github.com/labstack/echo/v4"
 	secp256k1secec "gitlab.com/yawning/secp256k1-voi/secec"
 )
-
-func newProxyHTTPClient(opts ...gttp.Option) *http.Client {
-	client := gttp.New(append(opts,
-		gttp.WithStrictSSRFProtection(),
-		gttp.WithNoProxy(),
-		gttp.WithTimeout(30*time.Second),
-		gttp.WithNoRetries(),
-		gttp.WithDisableCompression(),
-	)...)
-	checkRedirect := client.CheckRedirect
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if err := checkRedirect(req, via); err != nil {
-			return err
-		}
-		// Go rebuilds headers from the original request on every redirect.
-		for _, previous := range via {
-			if !strings.EqualFold(previous.URL.Scheme, req.URL.Scheme) || !strings.EqualFold(previous.URL.Host, req.URL.Host) {
-				req.Header.Del("Authorization")
-				break
-			}
-		}
-		return nil
-	}
-	return client
-}
 
 func (s *Server) proxyClient() *http.Client {
 	s.proxyHTTPClientOnce.Do(func() {

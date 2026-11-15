@@ -628,12 +628,25 @@ func TestOauthClientAuthBinding(t *testing.T) {
 						t.Fatal(err)
 					}
 					form.Set("refresh_token", token.RefreshToken)
+					other := token
+					other.ID = 0
+					other.Code, other.Token, other.RefreshToken = "other-code", "other-access", "other-refresh"
+					if err := s.db.Create(t.Context(), &other, nil).Error; err != nil {
+						t.Fatal(err)
+					}
 				}
 				w := httptest.NewRecorder()
 				s.echo.ServeHTTP(w, authorizationCodeRequest(t, s, form))
+				unrelatedSessions := int64(0)
+				if grant == "refresh_token" {
+					unrelatedSessions = 1
+					if err := s.db.First(t.Context(), &provider.OauthToken{}, "refresh_token = ?", "other-refresh").Error; err != nil {
+						t.Fatalf("another session for this account and client was revoked: %v", err)
+					}
+				}
 				if !wantSuccess {
 					assertInvalidGrant(t, w)
-					if countAuthRequests(t, s) != 0 || countOauthTokens(t, s) != 0 {
+					if countAuthRequests(t, s) != 0 || countOauthTokens(t, s) != unrelatedSessions {
 						t.Fatal("rejected binding must consume the code or revoke the session")
 					}
 					return
