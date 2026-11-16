@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -113,6 +116,9 @@ func TestOauthTokenRefreshInvalidGrant(t *testing.T) {
 				"refresh_token": {refresh},
 			})
 			assertInvalidGrant(t, w)
+			if countOauthTokens(t, s) != 0 {
+				t.Fatal("invalid refresh left its session usable")
+			}
 		})
 	}
 }
@@ -200,17 +206,18 @@ func TestOauthTokenRefreshRotation(t *testing.T) {
 				if w := refresh(token.RefreshToken); w.Code != 500 {
 					t.Fatalf("failed update: %d %s", w.Code, w.Body.String())
 				}
-				// Rotation and its history commit together or not at all.
-				var stored provider.OauthToken
-				if err := s.db.First(ctx, &stored, "id = ?", token.ID).Error; err != nil {
-					t.Fatal(err)
+				// Failed rotation rolls back history and revokes only this session.
+				if countOauthTokens(t, s) != 1 || history() != 0 {
+					t.Fatal("failed rotation left its session or partial history")
 				}
-				if stored.RefreshToken != token.RefreshToken || stored.Token != token.Token || history() != 0 {
-					t.Fatal("failed rotation left partial changes")
+				if err := s.db.First(ctx, &provider.OauthToken{}, "id = ? AND refresh_token = ?", other.ID, other.RefreshToken).Error; err != nil {
+					t.Fatalf("failed rotation changed an unrelated session: %v", err)
 				}
 				if err := s.db.Exec(ctx, "DROP TRIGGER fail_rotation", nil).Error; err != nil {
 					t.Fatal(err)
 				}
+				assertInvalidGrant(t, refresh(token.RefreshToken))
+				return
 			}
 			results := make(chan *httptest.ResponseRecorder, n)
 			for range n {
@@ -297,8 +304,9 @@ func TestOauthTokenRefreshRotation(t *testing.T) {
 			}
 			// The replaying caller disconnects as revocation starts.
 			replayCtx, cancelReplay := context.WithCancel(ctx)
+			defer cancelReplay()
 			if err := s.db.Client().Callback().Raw().Before("gorm:raw").Register("cancel-replay", func(tx *gorm.DB) {
-				if strings.Contains(tx.Statement.SQL.String(), "WHERE token_hash") {
+				if strings.HasPrefix(tx.Statement.SQL.String(), "DELETE FROM oauth_tokens") {
 					cancelReplay()
 				}
 			}); err != nil {
@@ -312,7 +320,7 @@ func TestOauthTokenRefreshRotation(t *testing.T) {
 				t.Fatal(err)
 			}
 			assertInvalidGrant(t, w)
-			if replayCtx.Err() == nil {
+			if name != "concurrent" && replayCtx.Err() == nil {
 				t.Fatal("replay was not canceled during revocation")
 			}
 			if countOauthTokens(t, s) != 1 {
@@ -378,6 +386,10 @@ func TestOauthRefreshRechecksAfterScopeResolution(t *testing.T) {
 				if err := s.db.Create(ctx, &token, nil).Error; err != nil {
 					t.Fatal(err)
 				}
+				// Compare against persisted precision (PostgreSQL stores microseconds).
+				if err := s.db.First(ctx, &token, "id = ?", token.ID).Error; err != nil {
+					t.Fatal(err)
+				}
 				resolved := false
 				s.scopeResolver = codeExchangeResolver(func(ctx context.Context) {
 					resolved = true
@@ -424,21 +436,122 @@ func TestOauthRefreshRechecksAfterScopeResolution(t *testing.T) {
 					}
 				} else {
 					assertInvalidGrant(t, w)
-					var rotated int64
-					if err := s.db.Raw(ctx, "SELECT COUNT(*) FROM oauth_tokens WHERE token != ? OR refresh_token != ?", nil, token.Token, token.RefreshToken).Scan(&rotated).Error; err != nil {
-						t.Fatal(err)
-					}
-					wantCount := int64(1)
-					if change == "token deletion" {
-						wantCount = 0
-					}
-					if rotated != 0 || countOauthTokens(t, s) != wantCount {
-						t.Fatal("rejected refresh changed stored credentials")
+					if countOauthTokens(t, s) != 0 {
+						t.Fatal("rejected refresh must revoke its session")
 					}
 				}
 			})
 		}
 	}
+}
+
+func TestOauthRefreshRejectionRevokesSession(t *testing.T) {
+	for _, name := range []string{"wrong client", "wrong auth method", "wrong proof", "missing proof", "scope failure", "account lookup failure", "signing failure", "cancellation", "invalid proof", "invalid client", "unknown token", "revocation failure"} {
+		t.Run(name, func(t *testing.T) {
+			s, account := endpointTestServer(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			auth, _ := authorizationCodeFixture(t, s, account)
+			token := provider.OauthToken{
+				ClientId: auth.ClientId, ClientAuth: auth.ClientAuth, Parameters: auth.Parameters,
+				Sub: account.Did, Token: "test-access", RefreshToken: "test-refresh", ExpiresAt: time.Now().Add(time.Hour),
+			}
+			switch name {
+			case "wrong client", "revocation failure":
+				token.ClientId = "http://localhost?scope=atproto"
+			case "wrong auth method":
+				token.ClientAuth.Method = "private_key_jwt"
+			case "scope failure":
+				token.Parameters.Scope = "atproto space:com.example.space"
+				s.spaceTypes = declaredSpaceTypes{}
+			case "account lookup failure":
+				if err := s.db.Exec(ctx, "DROP TABLE actors", nil).Error; err != nil {
+					t.Fatal(err)
+				}
+			case "cancellation":
+				token.Parameters.Scope = "atproto include:com.example.permissions"
+				s.scopeResolver = codeExchangeResolver(func(context.Context) { cancel() })
+			}
+			if err := s.db.Create(ctx, &token, nil).Error; err != nil {
+				t.Fatal(err)
+			}
+			if name == "revocation failure" {
+				if err := s.db.Exec(ctx, "CREATE TRIGGER fail_revoke BEFORE DELETE ON oauth_tokens BEGIN SELECT RAISE(ABORT, 'test failure'); END", nil).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			seedRefreshToken(t, s, account.Did, "unrelated-session")
+			form := url.Values{"client_id": {auth.ClientId}, "grant_type": {"refresh_token"}, "refresh_token": {token.RefreshToken}}
+			if name == "unknown token" {
+				form.Set("refresh_token", "not-issued")
+			} else if name == "invalid client" {
+				form.Set("client_id", "not-a-client")
+			}
+			r := authorizationCodeRequest(t, s, form).WithContext(ctx)
+			switch name {
+			case "wrong proof":
+				r.Header.Set("DPoP", newTestDpopProof(t, s, r.Method, r.URL.String(), nil))
+			case "missing proof":
+				r.Header.Del("DPoP")
+			case "invalid proof":
+				r.Header.Set("DPoP", "not-a-proof")
+			case "signing failure":
+				// ES256 cannot sign with a P-384 key. Build the valid request first.
+				key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+				if err != nil {
+					t.Fatal(err)
+				}
+				s.privateKey = key
+			}
+			w := httptest.NewRecorder()
+			s.echo.ServeHTTP(w, r)
+			wantStatus, wantCount, wantError := 400, int64(1), "invalid_grant"
+			switch name {
+			case "cancellation", "account lookup failure", "signing failure":
+				wantStatus, wantError = 500, "server_error"
+			case "scope failure":
+				wantError = "invalid_scope"
+			case "invalid proof":
+				wantCount, wantError = 2, "InvalidRequest"
+			case "invalid client":
+				wantCount, wantError = 2, ""
+			case "unknown token":
+				wantCount = 2
+			case "revocation failure":
+				wantStatus, wantCount, wantError = 500, 2, "Internal server error"
+			}
+			if w.Code != wantStatus || countOauthTokens(t, s) != wantCount {
+				t.Fatalf("status=%d sessions=%d, want %d/%d: %s", w.Code, countOauthTokens(t, s), wantStatus, wantCount, w.Body.String())
+			}
+			var body map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body["error"] == "" || (wantError != "" && body["error"] != wantError) {
+				t.Fatalf("expected %s: %s", wantError, w.Body.String())
+			}
+			if name == "revocation failure" {
+				if err := s.db.Exec(ctx, "DROP TRIGGER fail_revoke", nil).Error; err != nil {
+					t.Fatal(err)
+				}
+				w = httptest.NewRecorder()
+				s.echo.ServeHTTP(w, authorizationCodeRequest(t, s, form))
+				assertInvalidGrant(t, w)
+				if countOauthTokens(t, s) != 1 {
+					t.Fatal("retry did not revoke the rejected session")
+				}
+			}
+			if err := s.db.First(t.Context(), &provider.OauthToken{}, "refresh_token = ?", "unrelated-session").Error; err != nil {
+				t.Fatalf("rejection revoked unrelated session: %v", err)
+			}
+		})
+	}
+}
+
+func TestOauthRefreshLookupFailure(t *testing.T) {
+	s, _ := endpointTestServer(t)
+	if err := s.db.Exec(t.Context(), "DROP TABLE oauth_tokens", nil).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := postOauthToken(t, s, url.Values{"client_id": {"http://localhost"}, "grant_type": {"refresh_token"}, "refresh_token": {"unreadable"}})
+	assertInvalidGrant(t, w)
 }
 
 func TestOauthTokenAuthorizationCodeInvalidGrant(t *testing.T) {
