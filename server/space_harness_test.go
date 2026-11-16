@@ -22,7 +22,7 @@ func TestSpacesDisabledRoutes(t *testing.T) {
 	s.echo = echo.New()
 	s.addRoutes()
 	for _, route := range routes {
-		if !strings.HasPrefix(route.Path, "/xrpc/com.atproto.space.") && !strings.HasPrefix(route.Path, "/xrpc/com.atproto.simplespace.") {
+		if !strings.HasPrefix(route.Path, "/xrpc/com.atproto.space.") && !strings.HasPrefix(route.Path, "/xrpc/com.atproto.memberspace.") {
 			continue
 		}
 		t.Run(route.Path, func(t *testing.T) {
@@ -37,7 +37,7 @@ func TestSpacesDisabledRoutes(t *testing.T) {
 		})
 	}
 	// Unknown methods in these namespaces must not fall through to the proxy.
-	for _, path := range []string{"/xrpc/com.atproto.space.futureMethod", "/xrpc/com.atproto.simplespace.futureMethod"} {
+	for _, path := range []string{"/xrpc/com.atproto.space.futureMethod", "/xrpc/com.atproto.simplespace.futureMethod", "/xrpc/com.atproto.memberspace.futureMethod", "/xrpc/com.atproto.managedspace.futureMethod", "/xrpc/com.atproto.personalspace.futureMethod"} {
 		w := httptest.NewRecorder()
 		s.echo.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
 		if w.Code != http.StatusNotFound {
@@ -69,6 +69,7 @@ func TestSpacesDisabledRoutes(t *testing.T) {
 	for _, path := range []string{
 		"/xrpc/com.atproto.%73pace.listSpaces", "/xrpc/com.atproto.%73pace.futureMethod",
 		"/xrpc/com.atproto.%73implespace.getSpace", "/xrpc/com.atproto.%73implespace.futureMethod",
+		"/xrpc/com.atproto.%6demberspace.listMembers", "/xrpc/com.atproto.%6demberspace.futureMethod",
 	} {
 		for _, method := range []string{http.MethodGet, http.MethodPost} {
 			for _, token := range []string{"", session.AccessToken} {
@@ -99,7 +100,7 @@ func TestSpacesDisabledPreservesQueuedNotifications(t *testing.T) {
 	s := newTestServer(t)
 	// These expired entries would be deleted by the worker's first pass.
 	write := models.SpaceNotificationRetry{Repo: "did:web:test.invalid", Space: "test", RepoRev: "test", Data: []byte{1}}
-	deleted := models.SpaceDeletedNotificationRetry{Space: "test", Service: "did:web:test.invalid"}
+	deleted := models.SpaceSyncerNotificationRetry{Space: "test", Endpoint: "https://test.invalid", Token: "test", NoticeJson: `{}`}
 	for _, row := range []any{&write, &deleted} {
 		if err := s.db.Create(t.Context(), row, nil).Error; err != nil {
 			t.Fatal(err)

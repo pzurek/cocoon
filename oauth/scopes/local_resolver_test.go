@@ -16,7 +16,7 @@ import (
 
 func localLexiconCBOR(t *testing.T, kind, id string) []byte {
 	t.Helper()
-	doc, err := atdata.UnmarshalJSON([]byte(fmt.Sprintf(`{"$type":"com.atproto.lexicon.schema","lexicon":1,"id":%q,"defs":{"main":{"type":%q,"name":"Local","key":"tid","collections":["com.example.record"],"permissions":[{"type":"permission","resource":"space","spaceType":"com.example.group","collection":["com.example.record"]}]}}}`, id, kind)))
+	doc, err := atdata.UnmarshalJSON([]byte(fmt.Sprintf(`{"$type":"com.atproto.lexicon.schema","lexicon":1,"id":%q,"defs":{"main":{"type":%q,"title":"Local","key":"tid","collections":["com.example.record"],"permissions":[{"type":"permission","resource":"space","spaceType":"com.example.group","collection":["com.example.record"]}]}}}`, id, kind)))
 	if err != nil {
 		t.Fatal(err)
 	}

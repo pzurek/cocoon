@@ -4,14 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
+	"io"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/bluesky-social/gttp"
-	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/atclient"
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/lexicon"
@@ -71,7 +71,8 @@ func NewIndigoResolver() *IndigoResolver {
 
 // NewIndigoResolverWithPLCURL builds a resolver backed by indigo's default
 // identity directory configuration, but resolving did:plc identities against
-// plcURL. An empty plcURL uses indigo's default PLC directory.
+// plcURL. An empty plcURL uses indigo's default PLC directory. An explicitly
+// configured directory is trusted for direct DID-document fetches only.
 func NewIndigoResolverWithPLCURL(plcURL string) *IndigoResolver {
 	dir := identity.DefaultDirectory().(*identity.CacheDirectory)
 	base := dir.Inner.(*identity.BaseDirectory)
@@ -127,7 +128,9 @@ func (t *lexiconTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 	// Enforce the reference's public fetch URL policy on every actual request,
 	// including redirects. gttp separately binds IP checks to DNS resolution/dial.
-	if req.URL.Scheme != "https" || (req.URL.Port() != "" && req.URL.Port() != "443") || net.ParseIP(req.URL.Hostname()) != nil {
+	// ParseAddr also recognizes zoned IPv6 literals, unlike net.ParseIP.
+	_, ipErr := netip.ParseAddr(req.URL.Hostname())
+	if req.URL.Scheme != "https" || (req.URL.Port() != "" && req.URL.Port() != "443") || ipErr == nil {
 		return nil, fmt.Errorf("lexicon fetch requires HTTPS on port 443 with a DNS hostname")
 	}
 	return t.public.RoundTrip(req)
@@ -199,11 +202,29 @@ func (r *IndigoResolver) fetchLexicon(ctx context.Context, nsid syntax.NSID) (js
 	}
 	client := atclient.NewAPIClient(ident.PDSEndpoint())
 	client.Client = r.httpClient
-	proof, err := comatproto.SyncGetRecord(ctx, client, "com.atproto.lexicon.schema", did.String(), nsid.String())
+	req := atclient.NewAPIRequest(http.MethodGet, "com.atproto.sync.getRecord", nil)
+	req.QueryParams.Set("collection", "com.atproto.lexicon.schema")
+	req.QueryParams.Set("did", did.String())
+	req.QueryParams.Set("rkey", nsid.String())
+	resp, err := client.Do(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	record, err := verifyLexiconProof(ctx, proof, ident, nsid)
+	defer resp.Body.Close()
+	// Read the guarded body before decoding: json.Decoder can accept a complete
+	// value while ignoring a size-limit error returned with its final bytes.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading lexicon response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var failure atclient.ErrorBody
+		if err := json.Unmarshal(body, &failure); err != nil {
+			return nil, &atclient.APIError{StatusCode: resp.StatusCode}
+		}
+		return nil, failure.APIError(resp.StatusCode)
+	}
+	record, err := verifyLexiconProof(ctx, body, ident, nsid)
 	if err != nil {
 		return nil, fmt.Errorf("invalid lexicon proof: %w", err)
 	}

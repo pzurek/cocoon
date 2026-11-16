@@ -5,8 +5,6 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -331,24 +329,6 @@ func TestProxyTransport(t *testing.T) {
 			}
 		})
 	}
-}
-
-func proxyTestHTTPClient(t *testing.T, upstream *httptest.Server) *http.Client {
-	t.Helper()
-	roots := x509.NewCertPool()
-	roots.AddCert(upstream.Certificate())
-	client := newProxyHTTPClient(
-		gttp.WithTLSConfig(&tls.Config{RootCAs: roots, ServerName: "example.com"}),
-		gttp.WithDialContext(func(ctx context.Context, network, address string) (net.Conn, error) {
-			// Map only approved logical public IPs to the disposable TLS server.
-			if address != "203.0.113.10:443" && address != "203.0.113.10:8443" && address != "203.0.113.11:443" {
-				return nil, fmt.Errorf("unexpected dial: %s", address)
-			}
-			return (&net.Dialer{}).DialContext(ctx, network, upstream.Listener.Addr().String())
-		}),
-	)
-	t.Cleanup(client.CloseIdleConnections)
-	return client
 }
 
 func proxyTransportContext(t *testing.T, endpoint, method string) (*Server, echo.Context, *httptest.ResponseRecorder) {

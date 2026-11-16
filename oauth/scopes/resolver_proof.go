@@ -23,6 +23,14 @@ import (
 // CAR reads verify each block's hash before it enters the in-memory store; no
 // record or tree links are fetched separately, and unsigned JSON is never used.
 func verifyLexiconProof(ctx context.Context, proof []byte, ident *identity.Identity, nsid syntax.NSID) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Bound base58 decoding before Indigo processes the signing key.
+	// This includes legacy uncompressed P-256/K-256 keys.
+	if len(ident.Keys["atproto"].PublicKeyMultibase) > 128 {
+		return nil, fmt.Errorf("lexicon authority signing key exceeds 128 bytes")
+	}
 	key, err := ident.PublicKey()
 	if err != nil {
 		return nil, fmt.Errorf("lexicon authority signing key: %w", err)

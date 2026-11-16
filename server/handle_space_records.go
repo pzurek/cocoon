@@ -17,7 +17,7 @@ import (
 
 // Space record writes and reads (com.atproto.space.*), following the
 // reference PDS (packages/pds/src/api/com/atproto/space) at
-// bluesky-social/atproto ac0c9f15.
+// bluesky-social/atproto d4def6e9.
 
 const spaceMaxWrites = 200
 
@@ -82,7 +82,8 @@ func prepareSpaceDelete(did string, ref space.Ref, collection, rkey string) spac
 }
 
 // commitSpaceWrites applies writes to the caller's repo in one transaction,
-// under the account's write lock, then sends notifyWrite to the authority.
+// under the account's write lock, then sends notifyRepoUpdate to the
+// authority.
 func (s *Server) commitSpaceWrites(e echo.Context, did string, ref space.Ref, fn func(st *spaceStore) ([]spaceWrite, error)) (*spaceCommit, []spaceWrite, error) {
 	unlock := s.lockRepoWrite(did)
 	defer unlock()
@@ -104,12 +105,10 @@ func (s *Server) commitSpaceWrites(e echo.Context, did string, ref space.Ref, fn
 	if err != nil {
 		return nil, nil, err
 	}
-	if commit != nil {
-		// As in the reference, a notification that could neither be sent
-		// nor queued fails the request, though the write has landed.
-		if err := s.notifySpaceWrite(ref, did, commit); err != nil {
-			return nil, nil, err
-		}
+	// As in the reference, a notification that could neither be sent nor
+	// queued fails the request, though the write has landed.
+	if err := s.fireNotifyRepoUpdate(ref, did, commit); err != nil {
+		return nil, nil, err
 	}
 	return commit, writes, nil
 }
@@ -168,6 +167,9 @@ func (s *Server) handleSpaceCreateRecord(e echo.Context) error {
 		if in.Repo != a.did {
 			return nil, errForbidden("repo must match authenticated user")
 		}
+		if err := assertNotPolicyRecord(in.Collection); err != nil {
+			return nil, err
+		}
 		if err := a.assertSpaceRef(ref, scopes.SpaceMatch{Action: "create", Collection: in.Collection}); err != nil {
 			return nil, err
 		}
@@ -202,6 +204,9 @@ func (s *Server) handleSpacePutRecord(e echo.Context) error {
 		}
 		if in.Repo != a.did {
 			return nil, errForbidden("repo must match authenticated user")
+		}
+		if err := assertNotPolicyRecord(in.Collection); err != nil {
+			return nil, err
 		}
 		var w spaceWrite
 		_, _, err = s.commitSpaceWrites(e, a.did, ref, func(st *spaceStore) ([]spaceWrite, error) {
@@ -251,6 +256,9 @@ func (s *Server) handleSpaceDeleteRecord(e echo.Context) error {
 		}
 		if in.Repo != a.did {
 			return nil, errForbidden("repo must match authenticated user")
+		}
+		if err := assertNotPolicyRecord(in.Collection); err != nil {
+			return nil, err
 		}
 		if err := a.assertSpaceRef(ref, scopes.SpaceMatch{Action: "delete", Collection: in.Collection}); err != nil {
 			return nil, err
@@ -343,6 +351,9 @@ func (s *Server) handleSpaceApplyWrites(e echo.Context) error {
 			}
 		}
 		for _, w := range prepared {
+			if err := assertNotPolicyRecord(w.Collection); err != nil {
+				return nil, err
+			}
 			if err := a.assertSpaceRef(ref, scopes.SpaceMatch{Action: w.Action, Collection: w.Collection}); err != nil {
 				return nil, err
 			}
@@ -369,7 +380,7 @@ func (s *Server) handleSpaceApplyWrites(e echo.Context) error {
 // assertSpaceWriter refuses writes from an account that may not write now.
 func (s *Server) assertSpaceWriter(a *spaceAuth) error {
 	if a.repo != nil && a.repo.Repo.Deactivated {
-		return errInvalid("AccountDeactivated", "Account is deactivated")
+		return errAuthRequired("AccountDeactivated", "Account is deactivated")
 	}
 	return s.assertNotTakenDown(a.did)
 }
@@ -445,7 +456,7 @@ func (s *Server) handleSpaceGetRecord(e echo.Context) error {
 		if err != nil {
 			return nil, err
 		}
-		secret, err := s.spaceMacSecret(e, p, space.RecordMacType)
+		mac, err := s.spaceMacRequest(e, p, space.RecordMacProfile)
 		if err != nil {
 			return nil, err
 		}
@@ -465,7 +476,7 @@ func (s *Server) handleSpaceGetRecord(e echo.Context) error {
 		if err != nil {
 			return nil, err
 		}
-		setRecordMac(e, secret, uri, c)
+		setRecordMac(e, mac, uri, c)
 		return map[string]any{"uri": uri, "cid": rec.Cid, "value": val}, nil
 	}()
 	return writeSpaceResult(e, body, err)
@@ -486,15 +497,14 @@ func (s *Server) handleSpaceListRecords(e echo.Context) error {
 		if err != nil {
 			return nil, err
 		}
-		reverse, err := parseBoolParam(q.Get("reverse"))
-		if err != nil {
-			return nil, err
-		}
 		excludeValues, err := parseBoolParam(q.Get("excludeValues"))
 		if err != nil {
 			return nil, err
 		}
-		rows, err := s.spaceStore(nil, p.repo).listRecords(p.ref.String(), limit, q.Get("cursor"), reverse, collection)
+		if c := q.Get("cursor"); c != "" && !validAtURI(c) {
+			return nil, errInvalid("InvalidCursor", "Malformed cursor")
+		}
+		rows, err := s.spaceStore(nil, p.repo).listRecords(p.ref.String(), limit, q.Get("cursor"), collection)
 		if err != nil {
 			return nil, err
 		}
@@ -538,7 +548,7 @@ func (s *Server) handleSpaceListRepoOps(e echo.Context) error {
 		if err != nil {
 			return nil, err
 		}
-		secret, err := s.spaceMacSecret(e, p, space.CommitMacType)
+		mac, err := s.spaceMacRequest(e, p, space.CommitMacProfile)
 		if err != nil {
 			return nil, err
 		}
@@ -548,7 +558,7 @@ func (s *Server) handleSpaceListRepoOps(e echo.Context) error {
 		if c := q.Get("cursor"); c != "" {
 			rev, idxStr, _ := strings.Cut(c, "/")
 			if _, err := fmt.Sscanf(idxStr, "%d", &cursorIdx); err != nil {
-				return nil, errInvalid("MalformedCursor", "Malformed cursor")
+				return nil, errInvalid("InvalidCursor", "Malformed cursor")
 			}
 			cursorRev, hasCursor = rev, true
 		}
@@ -557,16 +567,16 @@ func (s *Server) handleSpaceListRepoOps(e echo.Context) error {
 		if err != nil {
 			return nil, err
 		}
-		// A full page leaves the commit off: the caller isn't at head yet.
-		var commit *space.Commit
-		if len(ops) < limit {
-			state, err := st.getRepoState(p.ref.String())
-			if err != nil {
-				return nil, err
-			}
-			if commit, err = buildCommit(p.ref, p.repo, state); err != nil {
-				return nil, err
-			}
+		state, err := st.getRepoState(p.ref.String())
+		if err != nil {
+			return nil, err
+		}
+		commit, err := buildCommit(p.ref, p.repo, state)
+		if err != nil {
+			return nil, err
+		}
+		if commit == nil {
+			return nil, errInvalid("RepoNotFound", "Could not find repo for space: %s", p.ref)
 		}
 		out := make([]map[string]any, 0, len(ops))
 		for _, op := range ops {
@@ -580,17 +590,15 @@ func (s *Server) handleSpaceListRepoOps(e echo.Context) error {
 			}
 			out = append(out, m)
 		}
-		res := map[string]any{"ops": out}
-		if commit != nil {
-			// A page without a commit has nothing to MAC. Its ops are checked
-			// once the final page's commit is compared against the syncer's
-			// running set hash.
-			setCommitMac(e, secret, *commit)
-			res["commit"] = commit
-		} else if len(ops) > 0 {
+		// Every page carries the repo's current commit, with a MAC. A full
+		// page may not be the last. In the rare event that it happens to end
+		// on the last op, it's fine, just an extra request by the client.
+		res := map[string]any{"ops": out, "commit": commit}
+		if len(ops) == limit {
 			last := ops[len(ops)-1]
 			res["cursor"] = fmt.Sprintf("%s/%d", last.Rev, last.Idx)
 		}
+		setCommitMac(e, mac, *commit)
 		return res, nil
 	}()
 	return writeSpaceResult(e, body, err)
@@ -602,7 +610,7 @@ func (s *Server) handleSpaceGetLatestCommit(e echo.Context) error {
 		if err != nil {
 			return nil, err
 		}
-		secret, err := s.spaceMacSecret(e, p, space.CommitMacType)
+		mac, err := s.spaceMacRequest(e, p, space.CommitMacProfile)
 		if err != nil {
 			return nil, err
 		}
@@ -617,7 +625,7 @@ func (s *Server) handleSpaceGetLatestCommit(e echo.Context) error {
 		if commit == nil {
 			return nil, errInvalid("RepoNotFound", "Could not find repo for space: %s", p.ref)
 		}
-		setCommitMac(e, secret, *commit)
+		setCommitMac(e, mac, *commit)
 		return map[string]any{"commit": commit}, nil
 	}()
 	return writeSpaceResult(e, body, err)
@@ -634,15 +642,21 @@ func (s *Server) handleSpaceListSpaces(e echo.Context) error {
 		if err != nil {
 			return nil, err
 		}
-		authority := q.Get("did")
+		authority := q.Get("spaceDid")
 		if authority != "" {
-			if _, err := parseDIDParam("did", authority); err != nil {
+			if _, err := parseDIDParam("spaceDid", authority); err != nil {
 				return nil, err
 			}
 		}
 		limit, err := parseLimitParam(q.Get("limit"), 50, 1, 100)
 		if err != nil {
 			return nil, err
+		}
+		cursor := q.Get("cursor")
+		if cursor != "" {
+			if _, err := space.ParseRef(cursor); err != nil {
+				return nil, errInvalid("InvalidCursor", "Malformed cursor")
+			}
 		}
 		// The filters are the target: an unfiltered listing needs a wildcard
 		// grant. Only the caller's own spaces are listed, so read_self fits.
@@ -656,13 +670,28 @@ func (s *Server) handleSpaceListSpaces(e echo.Context) error {
 		if err := a.assertSpace(m); err != nil {
 			return nil, err
 		}
-		rows, err := s.spaceStore(nil, a.did).listSpaces(limit, q.Get("cursor"), spaceType, authority)
+		rows, err := s.spaceStore(nil, a.did).listSpaces(limit, cursor, spaceType, authority)
 		if err != nil {
 			return nil, err
 		}
 		spaces := make([]map[string]any, 0, len(rows))
 		for _, r := range rows {
-			spaces = append(spaces, map[string]any{"uri": r.Uri})
+			out := map[string]any{"space": r.Uri}
+			if r.RepoRev != nil {
+				out["repoRev"] = *r.RepoRev
+			}
+			if r.SetHash != nil {
+				h, err := space.LtHashFromState(r.SetHash)
+				if err != nil {
+					return nil, err
+				}
+				d := h.Digest()
+				out["data"] = space.LexBytes(d[:])
+			}
+			if r.SpaceRev != nil {
+				out["spaceRev"] = *r.SpaceRev
+			}
+			spaces = append(spaces, out)
 		}
 		res := map[string]any{"spaces": spaces}
 		if len(rows) >= limit && len(rows) > 0 {
@@ -671,4 +700,9 @@ func (s *Server) handleSpaceListSpaces(e echo.Context) error {
 		return res, nil
 	}()
 	return writeSpaceResult(e, body, err)
+}
+
+// validAtURI is a loose check of an at:// URI used as a cursor.
+func validAtURI(s string) bool {
+	return strings.HasPrefix(s, "at://") && !strings.ContainsAny(s, " \t\r\n")
 }

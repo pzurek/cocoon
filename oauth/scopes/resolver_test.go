@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/gttp"
+	"github.com/bluesky-social/indigo/atproto/atclient"
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/haileyok/cocoon/internal/helpers"
@@ -95,13 +96,13 @@ func lexiconTestDNS(t *testing.T, did string) *net.Resolver {
 func TestLexiconResolutionBlocksPrivateDestinations(t *testing.T) {
 	const did = "did:plc:abcdefghijklmnopqrstuvwx"
 	dns := lexiconTestDNS(t, did)
-	for _, kind := range []string{"permission-set", "space"} {
+	for _, kind := range []string{"permission-set", "space", "space permissions"} {
 		for _, host := range []string{"127.0.0.1", "localhost", "pds.example.com"} {
 			t.Run(kind+"/"+host, func(t *testing.T) {
 				var hits atomic.Int32
 				pds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					hits.Add(1)
-					fmt.Fprintf(w, `{"value":{"lexicon":1,"id":"com.example.lexicon","defs":{"main":{"type":%q,"name":"Example","key":"tid","collections":["com.example.record"],"permissions":[]}}}}`, kind)
+					fmt.Fprintf(w, `{"value":{"lexicon":1,"id":"com.example.lexicon","defs":{"main":{"type":%q,"title":"Example","key":"tid","collections":["com.example.record"],"permissions":[]}}}}`, kind)
 				}))
 				defer pds.Close()
 				_, port, _ := net.SplitHostPort(pds.Listener.Addr().String())
@@ -114,6 +115,8 @@ func TestLexiconResolutionBlocksPrivateDestinations(t *testing.T) {
 				var err error
 				if kind == "space" {
 					_, err = r.ResolveSpaceCollections(t.Context(), "com.example.lexicon")
+				} else if kind == "space permissions" {
+					_, err = r.ResolveSpacePermissions(t.Context(), "com.example.lexicon")
 				} else {
 					_, err = r.ResolvePermissionSet(t.Context(), "com.example.lexicon")
 				}
@@ -144,33 +147,70 @@ func TestLexiconResolutionBlocksPrivateDIDWeb(t *testing.T) {
 	}
 }
 
+func TestLexiconResolutionCancelsDNS(t *testing.T) {
+	r := NewIndigoResolver()
+	started := make(chan struct{}, 1)
+	r.dns.Resolver = net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		select {
+		case <-started:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	_, err := r.ResolvePermissionSet(ctx, "com.example.lexicon")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want DNS cancellation, got %v", err)
+	}
+}
+
 func TestLexiconSuppliedDirectoryPrivatePDS(t *testing.T) {
 	const did = "did:plc:abcdefghijklmnopqrstuvwx"
 	dns := lexiconTestDNS(t, did)
-	dir := identity.NewMockDirectory()
-	dir.Insert(identity.Identity{DID: syntax.DID(did), Services: map[string]identity.ServiceEndpoint{
-		"atproto_pds": {Type: "AtprotoPersonalDataServer", URL: "https://private.example.com"},
-	}})
-	r := NewIndigoResolverWithDirectory(dir)
-	r.dns.Resolver = net.Resolver{PreferGo: true, Dial: dns.Dial}
-	// Keep the production guard; only route DNS to the disposable test server.
-	r.httpClient = newLexiconHTTPClient("", gttp.WithResolver(dns), gttp.WithDialContext(func(context.Context, string, string) (net.Conn, error) {
-		t.Error("private DNS result reached the dialer")
-		return nil, fmt.Errorf("unexpected dial")
-	}))
-	_, err := r.ResolvePermissionSet(t.Context(), "com.example.lexicon")
-	if !errors.Is(err, gttp.ErrBlockedByIPPolicy) {
-		t.Fatalf("want private DNS rejection, got %v", err)
+	for _, endpoint := range []string{"https://private.example.com", "https://127.0.0.1", "https://[::%25lo]", "https://[64:ff9b::7f00:1%25lo]", "https://public.example.com:8443"} {
+		t.Run(endpoint, func(t *testing.T) {
+			dir := identity.NewMockDirectory()
+			dir.Insert(identity.Identity{DID: syntax.DID(did), Services: map[string]identity.ServiceEndpoint{
+				"atproto_pds": {Type: "AtprotoPersonalDataServer", URL: endpoint},
+			}})
+			r := NewIndigoResolverWithDirectory(dir)
+			r.dns.Resolver = net.Resolver{PreferGo: true, Dial: dns.Dial}
+			// Keep the production guard; only route DNS to the disposable test server.
+			r.httpClient = newLexiconHTTPClient("", gttp.WithResolver(dns), gttp.WithDialContext(func(context.Context, string, string) (net.Conn, error) {
+				t.Error("unsafe destination reached the dialer")
+				return nil, fmt.Errorf("unexpected dial")
+			}))
+			_, err := r.ResolvePermissionSet(t.Context(), "com.example.lexicon")
+			if endpoint == "https://private.example.com" {
+				if !errors.Is(err, gttp.ErrBlockedByIPPolicy) {
+					t.Fatalf("want private DNS rejection, got %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "lexicon fetch requires HTTPS") {
+				t.Fatalf("want URL policy rejection, got %v", err)
+			}
+		})
 	}
 }
 
 func TestLexiconResolutionPublicFetch(t *testing.T) {
-	const did = "did:plc:abcdefghijklmnopqrstuvwx"
-	dns := lexiconTestDNS(t, did)
-	for _, mode := range []string{"permission-set", "P256", "partial", "space", "space permissions", "space forged signature", "space permissions forged signature", "public redirect", "private redirect", "HTTP redirect", "IP redirect", "port redirect", "oversized", "cancel body", "deadline body", "unsigned JSON", "forged signature", "tampered commit", "wrong DID", "wrong path", "tampered record CID", "wrong ID", "wrong type", "wrong version", "missing defs", "missing commit", "missing MST", "missing record", "multiple roots", "bad prefix", "negative prefix"} {
+	for _, mode := range []string{"permission-set", "space", "DID-web", "DID-web redirect", "public redirect", "private redirect", "HTTP redirect", "IP redirect", "port redirect", "oversized", "at limit", "over limit", "space at limit", "space over limit", "API error", "non-JSON error", "cancel body", "deadline body", "unsigned JSON", "P256", "partial", "space permissions", "space forged signature", "space permissions forged signature", "forged signature", "tampered commit", "wrong DID", "wrong path", "tampered record CID", "wrong ID", "wrong type", "wrong version", "missing defs", "missing commit", "missing MST", "missing record", "multiple roots", "bad prefix", "negative prefix"} {
 		t.Run(mode, func(t *testing.T) {
+			did := "did:plc:abcdefghijklmnopqrstuvwx"
+			if strings.HasPrefix(mode, "DID-web") {
+				did = "did:web:public.example.com"
+			}
+			dns := lexiconTestDNS(t, did)
 			kind := "permission-set"
-			if mode == "space" || mode == "space forged signature" {
+			if strings.HasPrefix(mode, "space") && !strings.HasPrefix(mode, "space permissions") {
 				kind = "space"
 			}
 			fixtureMode := mode
@@ -178,10 +218,25 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 				fixtureMode = "forged signature"
 			}
 			proof, publicKey := lexiconProofFixture(t, kind, fixtureMode)
+			if strings.HasSuffix(mode, "limit") {
+				size := 2 << 20
+				if strings.Contains(mode, "over limit") {
+					size++
+				}
+				proof = lexiconProofAtSize(t, proof, size)
+			}
 			var requests atomic.Int32
 			started := make(chan struct{}, 1)
 			pds := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				requests.Add(1)
+				if req.URL.Path == "/.well-known/did.json" {
+					if mode == "DID-web redirect" {
+						http.Redirect(w, req, "/other-did.json", http.StatusFound)
+					} else {
+						fmt.Fprintf(w, `{"id":%q,"verificationMethod":[{"id":"#atproto","type":"Multikey","controller":%q,"publicKeyMultibase":%q}],"service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://public.example.com"}]}`, did, did, publicKey)
+					}
+					return
+				}
 				if req.URL.Path != "/record" {
 					if req.URL.Path != "/xrpc/com.atproto.sync.getRecord" || req.URL.Query().Get("did") != did || req.URL.Query().Get("collection") != "com.atproto.lexicon.schema" || req.URL.Query().Get("rkey") != "com.example.lexicon" {
 						t.Errorf("wrong record request: %s", req.URL)
@@ -201,6 +256,13 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 						return
 					case "port redirect":
 						http.Redirect(w, req, "https://public.example.com:8443/record", http.StatusFound)
+						return
+					case "API error":
+						w.WriteHeader(http.StatusForbidden)
+						fmt.Fprint(w, `{"error":"Forbidden","message":"not available"}`)
+						return
+					case "non-JSON error":
+						http.Error(w, "unavailable", http.StatusServiceUnavailable)
 						return
 					}
 				}
@@ -232,7 +294,7 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 			localChecks := 0
 			r.SetLocalLexiconReader(func(_ context.Context, authority syntax.DID, nsid syntax.NSID) ([]byte, bool, error) {
 				localChecks++
-				if authority != did || nsid != "com.example.lexicon" {
+				if authority != syntax.DID(did) || nsid != "com.example.lexicon" {
 					t.Fatalf("wrong local lookup before remote fallback: %s/%s", authority, nsid)
 				}
 				return nil, false, nil
@@ -244,7 +306,7 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 			})
 			roots := x509.NewCertPool()
 			roots.AddCert(pds.Certificate())
-			r.httpClient = newLexiconHTTPClient("",
+			opts := []gttp.Option{
 				gttp.WithResolver(dns),
 				gttp.WithTLSConfig(&tls.Config{RootCAs: roots, ServerName: "example.com"}),
 				gttp.WithDialContext(func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -255,7 +317,12 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 					}
 					return (&net.Dialer{}).DialContext(ctx, network, pds.Listener.Addr().String())
 				}),
-			)
+			}
+			r.httpClient = newLexiconHTTPClient("", opts...)
+			if strings.HasPrefix(mode, "DID-web") {
+				base := r.dir.(*identity.CacheDirectory).Inner.(*identity.BaseDirectory)
+				base.HTTPClient = *newLexiconHTTPClient("", append(opts, gttp.WithNoRedirects())...)
+			}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			if mode == "cancel body" {
@@ -289,8 +356,14 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 				}
 				return
 			}
-			if mode == "space" {
+			if strings.HasPrefix(mode, "space") {
 				cols, err := r.ResolveSpaceCollections(ctx, "com.example.lexicon")
+				if mode == "space over limit" {
+					if !errors.Is(err, gttp.ErrResponseTooLarge) {
+						t.Fatalf("want size rejection, got collections=%v, error=%v", cols, err)
+					}
+					return
+				}
 				if err != nil || len(cols) != 1 || cols[0] != "com.example.record" {
 					t.Fatalf("collections=%v, error=%v", cols, err)
 				}
@@ -298,7 +371,7 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 			}
 			ps, err := r.ResolvePermissionSet(ctx, "com.example.lexicon")
 			switch mode {
-			case "permission-set", "public redirect", "P256", "partial":
+			case "permission-set", "public redirect", "DID-web", "at limit", "P256", "partial":
 				if err != nil || len(ps.Permissions) != 2 || ps.Permissions[0].Resource != "repo" || ps.Permissions[0].Action[0] != "create" {
 					t.Fatalf("permission-set=%+v, error=%v", ps, err)
 				}
@@ -306,7 +379,7 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 				if _, err := r.ResolvePermissionSet(ctx, "com.example.lexicon"); err != nil || requests.Load() != before {
 					t.Fatalf("cache did not preserve result: %v", err)
 				}
-			case "oversized":
+			case "oversized", "over limit":
 				if !errors.Is(err, gttp.ErrResponseTooLarge) {
 					t.Fatalf("want size rejection, got %v", err)
 				}
@@ -317,6 +390,18 @@ func TestLexiconResolutionPublicFetch(t *testing.T) {
 			case "deadline body":
 				if !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatalf("want deadline, got %v", err)
+				}
+			case "API error", "non-JSON error":
+				var apiErr *atclient.APIError
+				if !errors.As(err, &apiErr) {
+					t.Fatalf("want API error, got %v", err)
+				}
+				if mode == "API error" {
+					if apiErr.StatusCode != http.StatusForbidden || apiErr.Name != "Forbidden" || apiErr.Message != "not available" {
+						t.Fatalf("lost API error details: %+v", apiErr)
+					}
+				} else if apiErr.StatusCode != http.StatusServiceUnavailable {
+					t.Fatalf("lost HTTP status: %+v", apiErr)
 				}
 			default:
 				if err == nil || requests.Load() != 1 {

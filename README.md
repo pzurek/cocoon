@@ -309,6 +309,20 @@ backup history, and account for legacy nested keys and object versions. Reclamat
 of objects or charges, retention-policy changes and CDN purges are explicit
 operator actions; none is performed by an ordinary record deletion.
 
+#### Outbound proxy requests
+
+Requests forwarded to AppViews, chat services and feed generators must use public destinations. Cocoon blocks private and loopback addresses, including DNS answers and redirect targets, and refuses HTTPS-to-HTTP redirects. Service credentials are removed for the rest of a redirect chain once it changes scheme, host or port.
+
+These requests connect directly, ignoring `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`. Private-network AppViews are not supported. The configured PLC directory is separate and unchanged. The fork retains its stricter proxy timeouts: 10 seconds for response headers and 30 seconds for the whole request.
+
+#### Lexicon lookups
+
+OAuth permission-set and Spaces type lookups fetch identity documents and lexicon records directly, without environment proxies. Public fetches require HTTPS, a DNS hostname and port 443; private addresses are blocked even when returned by DNS or reached through a redirect. Identity-document redirects are not followed. Each HTTP request has a ten-second timeout and a 2 MiB response limit, with a thirty-second limit for the full lookup.
+
+Lexicon records must be returned by `com.atproto.sync.getRecord` with a signed repository commit and an inclusion proof for the requested record. Cocoon checks the signature against the authority's DID signing key, verifies the record's content and NSID, and bounds proof decoding. Unsigned `com.atproto.repo.getRecord` responses are no longer accepted. A valid proof authenticates a published record; it does not establish that the record is the latest version.
+
+The configured PLC directory remains trusted for direct DID-document requests, so a local PLC still works. This exception does not extend to redirects or the PDS endpoints listed in its documents. Lexicons hosted on private, HTTP, IP-literal or custom-port PDS endpoints cannot be resolved.
+
 #### PLC Directory
 
 Cocoon uses the public PLC directory (`https://plc.directory`) to create, update, and resolve `did:plc` identities. You can point it at a different directory, such as a local PLC instance for integration testing, so that test accounts are never registered with the real directory:
@@ -450,11 +464,12 @@ receive older CIDs again. CID ordering, deduplication, and cursors still apply.
 Cocoon implements the ATProto Spaces alpha. See [docs/spaces.md](docs/spaces.md).
 
 Set `COCOON_SPACES_ENABLED=false` (or `--spaces-enabled=false` before `run`)
-to disable both Spaces namespaces and background notification retries. Spaces
+to disable all Spaces namespaces and background notification retries. Spaces
 remain enabled by default. Disabled methods return 404 instead of falling through
-to the XRPC proxy. Existing Spaces data is retained and migrations still run, so
-re-enabling does not discard memberships, records or pending notifications. This
-switch does not control automatic PLC KEM-key backfill or account key creation.
+to the XRPC proxy. Migrations still run while disabled, including the November
+alpha's conversion of legacy policy/member tables and removal of obsolete
+notification registrations. This switch does not control automatic PLC KEM-key
+backfill or account key creation.
 
 Automatic KEM-key backfill is **off by default**. To upgrade existing accounts,
 explicitly set `COCOON_KEM_BACKFILL_ENABLED=true` (or `--kem-backfill-enabled`
@@ -465,13 +480,14 @@ before opting in; rehearse with disposable identities first. A copied database
 with real keys and network access is not an isolated test. New-account key
 creation and user-requested identity operations are unaffected by this setting.
 
-- [x] `com.atproto.space.createRecord`, `putRecord`, `deleteRecord`, `applyWrites`
+- [x] `com.atproto.space.createRecord`, `putRecord`, `deleteRecord`, `applyWrites`, `clearRecords`
 - [x] `com.atproto.space.getRecord`, `listRecords`, `listRepoOps`, `getLatestCommit`, `getRepo`, `listSpaces`
 - [x] `com.atproto.space.getBlob`, `listBlobs`
-- [x] `com.atproto.space.getDelegationToken`, `getSpaceCredential`, `notifyCredentialRevoked`
-- [x] `com.atproto.space.notifyWrite`, `registerNotify`, `unregisterNotify`, `listRepos`
-- [x] `com.atproto.simplespace.createSpace`, `getSpace`, `updateSpace`, `deleteSpace`
-- [x] `com.atproto.simplespace.putMember`, `removeMember`, `listMembers`
+- [x] `com.atproto.space.getDelegationToken`, `authorizeSpaceSync`, `notifyCredentialsRevoked`
+- [x] `com.atproto.space.notifyRepoUpdate`, `listWriters`, `removeWriter`
+- [x] `com.atproto.space.createSpace`, `getSpace`, `updateSpace`, `deleteSpace`
+- [x] `com.atproto.space.exportSpaceMeta`, `importSpaceMeta`, `importRepo`
+- [x] `com.atproto.memberspace.putMembers`, `removeMembers`, `listMembers`
 
 ### Other
 

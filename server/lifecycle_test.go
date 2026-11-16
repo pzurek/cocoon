@@ -494,7 +494,7 @@ func TestSpaceFanoutCancelsActiveDelivery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := s.spaceStore(nil, acct.Did).createSpace(ref, models.SimplespaceConfig{WritePolicy: policyPublic}); err != nil {
+			if err := s.spaceStore(nil, acct.Did).createSpace(ref, &spacePolicy{Type: policyMember, PublicWrite: true}); err != nil {
 				t.Fatal(err)
 			}
 			entered, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -516,7 +516,7 @@ func TestSpaceFanoutCancelsActiveDelivery(t *testing.T) {
 			}
 			s.passport = identity.NewPassport(endpoint.Client(), cache)
 			s.spaceHTTP = endpoint.Client()
-			recipient := models.SpaceCredentialRecipient{Did: acct.Did, Space: ref.String(), ServiceDid: service, ServiceEndpoint: endpoint.URL, ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339Nano)}
+			recipient := models.SpaceNotifyRegistration{Did: acct.Did, Space: ref.String(), Endpoint: endpoint.URL, Token: "test-token", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339Nano)}
 			if err := s.db.Client().Create(&recipient).Error; err != nil {
 				t.Fatal(err)
 			}
@@ -524,9 +524,15 @@ func TestSpaceFanoutCancelsActiveDelivery(t *testing.T) {
 			defer cancel()
 			s.workerCtx = ctx
 			if deleted {
-				err = s.deleteSpace(context.Background(), ref)
+				var regs []models.SpaceNotifyRegistration
+				regs, err = s.deleteSpace(context.Background(), ref)
+				if err == nil {
+					s.goSpace(func(ctx context.Context) {
+						s.notifySyncers(ctx, ref, regs, syncerNotice{deleted: true})
+					})
+				}
 			} else {
-				err = s.processNotifyWrite(context.Background(), notifyWriteBody{Space: ref.String(), Repo: acct.Did, RepoRev: nextTID(""), Data: []byte{1}})
+				err = s.processNotifyRepoUpdate(context.Background(), notifyRepoUpdateBody{Space: ref.String(), Repo: acct.Did, RepoRev: nextTID(""), Data: []byte{1}})
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -561,9 +567,9 @@ func TestSpaceWorkerCancelsDeepQueries(t *testing.T) {
 		deleted     bool
 	}{
 		{"write-space", "spaces", false},
-		{"write-config", "simplespace_configs", false},
-		{"write-recipients", "space_credential_recipients", false},
-		{"write-member", "simplespace_members", false},
+		{"write-policy", "space_policies", false},
+		{"write-recipients", "space_notify_registrations", false},
+		{"write-member", "memberspace_members", false},
 		{"deleted-space", "spaces", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -575,7 +581,7 @@ func TestSpaceWorkerCancelsDeepQueries(t *testing.T) {
 				t.Fatal(err)
 			}
 			st := s.spaceStore(nil, authority.Did)
-			if err := st.createSpace(ref, models.SimplespaceConfig{WritePolicy: policyMemberList}); err != nil {
+			if err := st.createSpace(ref, &spacePolicy{Type: policyMember}); err != nil {
 				t.Fatal(err)
 			}
 			if err := st.putMember(ref.String(), writer.Did, true, true); err != nil {
@@ -586,7 +592,7 @@ func TestSpaceWorkerCancelsDeepQueries(t *testing.T) {
 				if err := st.deleteSpace(ref.String()); err != nil {
 					t.Fatal(err)
 				}
-				row = &models.SpaceDeletedNotificationRetry{Space: ref.String(), Service: "did:web:unused.test", ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}
+				row = &models.SpaceSyncerNotificationRetry{Space: ref.String(), Endpoint: "https://unused.test", Token: "test-token", NoticeJson: `{"$type":"com.atproto.space.notifySpaceUpdate#spaceDeleted"}`, ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}
 			}
 			if err := s.db.Client().Create(row).Error; err != nil {
 				t.Fatal(err)
@@ -609,6 +615,9 @@ func TestSpaceWorkerCancelsDeepQueries(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			s.workerCtx = ctx
 			s.startSpaceWorkers()
 			t.Cleanup(s.stopSpaceWorkers)
 			defer close(release)
@@ -618,7 +627,7 @@ func TestSpaceWorkerCancelsDeepQueries(t *testing.T) {
 				t.Fatalf("retry did not reach %s query", tc.table)
 			}
 			done := make(chan struct{})
-			go func() { s.stopSpaceWorkers(); close(done) }()
+			go func() { cancel(); s.stopSpaceWorkers(); close(done) }()
 			select {
 			case <-done:
 			case <-time.After(time.Second):
